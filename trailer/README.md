@@ -10,4 +10,4 @@ make wasm
 node trailer/scripts/capture-gameplay.mjs --no-build
 ```
 
-The script verifies the capture dimensions, visual settings, path movement, and final map position before writing `trailer/public/gameplay/walking.mp4`. Temporary replay frames live under `build/capture-battle-pyramid/`.
+The script verifies the capture dimensions, visual settings, path movement, and final map position before writing `trailer/public/gameplay/walking.mp4` and the 960 × 640 README encode at `trailer/public/gameplay/walking-readme.mp4`. Temporary replay frames live under `build/capture-battle-pyramid/`.

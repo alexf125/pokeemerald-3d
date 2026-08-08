@@ -12,6 +12,7 @@ const replayOutput = resolve(tmpDir, 'replay');
 const generatedRoute = resolve(tmpDir, 'route.txt');
 const frameDir = resolve(tmpDir, 'frames');
 const output = resolve(trailerDir, 'public/gameplay/walking.mp4');
+const readmeOutput = resolve(trailerDir, 'public/gameplay/walking-readme.mp4');
 const noBuild = process.argv.includes('--no-build');
 const seconds = 12;
 const fps = 30;
@@ -160,4 +161,11 @@ await run('ffmpeg', [
   '-an', '-c:v', 'libx264', '-preset', 'slow', '-crf', '16',
   '-pix_fmt', 'yuv420p', '-movflags', '+faststart', output,
 ], trailerDir);
-console.log(`Wrote trailer/public/gameplay/walking.mp4 (${sampleCount} frames)`);
+await run('ffmpeg', [
+  '-y', '-hide_banner', '-loglevel', 'error', '-framerate', String(fps),
+  '-i', resolve(frameDir, 'frame-%04d.png'),
+  '-vf', 'scale=960:640:flags=lanczos',
+  '-an', '-c:v', 'libx264', '-preset', 'slow', '-crf', '18',
+  '-pix_fmt', 'yuv420p', '-movflags', '+faststart', readmeOutput,
+], trailerDir);
+console.log(`Wrote trailer/public/gameplay/walking.mp4 and walking-readme.mp4 (${sampleCount} frames each)`);

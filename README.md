@@ -2,7 +2,7 @@
 
 [Play pokeemerald-3d](https://3d.pokeemerald.com/)
 
-<video src="trailer/public/gameplay/walking.mp4" controls autoplay muted loop playsinline></video>
+https://github.com/user-attachments/assets/791051d6-8878-4b22-a011-959806617956
 
 Pokemon Emerald in 3D (in WebAssembly)
 
