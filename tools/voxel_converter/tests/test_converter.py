@@ -8,7 +8,7 @@ from pathlib import Path
 
 from tools.voxel_converter.convert import main as convert_main
 from tools.voxel_converter.exporters import export_glb, export_gltf, export_json, export_vox
-from tools.voxel_converter.generator import Voxel, VoxelModel, generate_voxel_model
+from tools.voxel_converter.generator import SUBVOXEL_SCALE, Voxel, VoxelModel, generate_voxel_model
 from tools.voxel_converter.parser import (
     find_repo_root,
     load_behavior_material_names,
@@ -50,6 +50,8 @@ class VoxelConverterTests(unittest.TestCase):
         )
         self.assertEqual(littleroot.size_x, 80)
         self.assertEqual(littleroot.size_y, 80)
+        # LittlerootTown house door at (5, 8) should sit above the ground tile
+        # directly in front of it at (5, 7).
         self.assertGreater(
             cell_top_height(littleroot, 5, 8),
             cell_top_height(littleroot, 5, 7),
@@ -59,6 +61,8 @@ class VoxelConverterTests(unittest.TestCase):
             parse_map(self.repo_root, "SootopolisCity"),
             behavior_materials,
         )
+        # Sootopolis upper platform near the gym/cave approach should remain
+        # above the lower water ring.
         self.assertGreater(
             cell_top_height(sootopolis, 31, 33),
             cell_top_height(sootopolis, 31, 41),
@@ -68,6 +72,8 @@ class VoxelConverterTests(unittest.TestCase):
             parse_map(self.repo_root, "FortreeCity"),
             behavior_materials,
         )
+        # Fortree bridge spans around (30, 14) should resolve as a distinct
+        # walkable level without exploding into the raw elevation-15 spike.
         self.assertNotEqual(
             cell_top_height(fortree, 30, 14),
             cell_top_height(fortree, 29, 14),
@@ -82,6 +88,7 @@ class VoxelConverterTests(unittest.TestCase):
             parse_map(self.repo_root, "Route108"),
             behavior_materials,
         )
+        # The Route 108 abandoned ship stairs should preserve a local gradient.
         stair_heights = block_top_heights(route108, 29, 6)
         self.assertGreater(len(set(stair_heights)), 1)
         self.assertGreater(max(stair_heights), min(stair_heights))
@@ -134,11 +141,18 @@ def cell_top_height(model: VoxelModel, cell_x: int, cell_y: int) -> int:
 def block_top_heights(model: VoxelModel, cell_x: int, cell_y: int) -> list[int]:
     tops: dict[tuple[int, int], int] = defaultdict(lambda: -1)
     for voxel in model.voxels:
-        if cell_x * 4 <= voxel.x < cell_x * 4 + 4 and cell_y * 4 <= voxel.y < cell_y * 4 + 4:
-            local_x = voxel.x - cell_x * 4
-            local_y = voxel.y - cell_y * 4
+        if (
+            cell_x * SUBVOXEL_SCALE <= voxel.x < cell_x * SUBVOXEL_SCALE + SUBVOXEL_SCALE
+            and cell_y * SUBVOXEL_SCALE <= voxel.y < cell_y * SUBVOXEL_SCALE + SUBVOXEL_SCALE
+        ):
+            local_x = voxel.x - cell_x * SUBVOXEL_SCALE
+            local_y = voxel.y - cell_y * SUBVOXEL_SCALE
             tops[(local_x, local_y)] = max(tops[(local_x, local_y)], voxel.z)
-    return [tops[(x, y)] for y in range(4) for x in range(4)]
+    return [
+        tops[(x, y)]
+        for y in range(SUBVOXEL_SCALE)
+        for x in range(SUBVOXEL_SCALE)
+    ]
 
 
 if __name__ == "__main__":

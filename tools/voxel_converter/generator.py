@@ -8,6 +8,9 @@ DEFAULT_BEHAVIOR_MATERIAL = "ground"
 ELEVATION_TRANSITION = 0
 ELEVATION_MULTI_LEVEL = 15
 SUBVOXEL_SCALE = 4
+# Extra voxel height for structure-like tiles once they inherit the surrounding
+# walkable elevation. This keeps doors/building fronts visibly raised above the
+# terrain without inflating them into multi-storey towers.
 STRUCTURE_HEIGHT = 4
 RAMP_BEHAVIOR_TOKENS = ("STAIR", "LADDER", "ESCALATOR")
 STRUCTURE_BEHAVIOR_TOKENS = ("DOOR", "PC", "COUNTER", "TELEVISION", "REGION_MAP")
@@ -153,7 +156,9 @@ def resolve_elevations(
 
     # Three passes are enough for the local transition patterns used in these
     # maps because stairs, ladders, doors, and bridge joins only need to inherit
-    # nearby elevations from immediately adjacent tiles.
+    # nearby elevations from immediately adjacent tiles, then settle across at
+    # most a couple of chained transition tiles. If a future map introduces
+    # longer unresolved chains, this loop can be widened safely.
     for _ in range(3):
         changed = False
         for cell in parsed_map.cells:
@@ -162,7 +167,9 @@ def resolve_elevations(
                 continue
             neighbor_levels = neighboring_levels(cell.x, cell.y, cells_by_pos, resolved)
             if cell.elevation == ELEVATION_MULTI_LEVEL:
-                level = dominant_level(neighbor_levels) or inherited_level(cell, materials_by_cell, neighbor_levels)
+                level = dominant_level(neighbor_levels)
+                if level is None:
+                    level = inherited_level(cell, materials_by_cell, neighbor_levels)
             else:
                 level = inherited_level(cell, materials_by_cell, neighbor_levels)
             if level is None:
@@ -247,10 +254,13 @@ def inherited_level(
     if not neighbor_levels:
         return None
     material_name = materials_by_cell[(cell.x, cell.y)]
-    if cell.elevation == ELEVATION_MULTI_LEVEL or material_name == "structure" or cell.collision or cell.layer_type != 0:
+    if prefers_raised_level(cell, material_name):
         positive_levels = [level for level in neighbor_levels if level > 0]
         if positive_levels:
-            return dominant_level(positive_levels) or max(positive_levels)
+            level = dominant_level(positive_levels)
+            if level is not None:
+                return level
+            return max(positive_levels)
     if cell.elevation == ELEVATION_TRANSITION:
         positive_levels = [level for level in neighbor_levels if level > 0]
         if positive_levels:
@@ -264,6 +274,9 @@ def dominant_level(levels: list[int]) -> int | None:
     counts: dict[int, int] = {}
     for level in levels:
         counts[level] = counts.get(level, 0) + 1
+    # When neighboring levels tie, prefer the higher walkable surface so
+    # multi-level markers and doorway transitions do not sink back into the
+    # lower ground plane.
     return max(counts, key=lambda level: (counts[level], level))
 
 
@@ -279,9 +292,24 @@ def should_ramp(
         return False
     if any(token in cell.behavior_name for token in RAMP_BEHAVIOR_TOKENS):
         return True
-    return cell.elevation == ELEVATION_TRANSITION and not (
-        cell.collision or cell.layer_type != 0 or any(token in cell.behavior_name for token in STRUCTURE_BEHAVIOR_TOKENS)
+    if cell.elevation != ELEVATION_TRANSITION:
+        return False
+    return is_walkable_transition(cell)
+
+
+def prefers_raised_level(cell: ParsedCell, material_name: str) -> bool:
+    return (
+        cell.elevation == ELEVATION_MULTI_LEVEL
+        or material_name == "structure"
+        or bool(cell.collision)
+        or cell.layer_type != 0
     )
+
+
+def is_walkable_transition(cell: ParsedCell) -> bool:
+    if cell.collision or cell.layer_type != 0:
+        return False
+    return not any(token in cell.behavior_name for token in STRUCTURE_BEHAVIOR_TOKENS)
 
 
 def ramp_block_heights(
@@ -298,9 +326,14 @@ def ramp_block_heights(
     delta_y = south - north
     heights: list[int] = []
     if abs(delta_x) >= abs(delta_y):
+        # Use the neighboring elevations directly so explicit stair/ramp tiles
+        # can bridge the full vertical gap instead of flattening back to the
+        # cell's inherited midpoint.
         start = west
         end = east
-        for block_y in range(SUBVOXEL_SCALE):
+        # Prefer an x-axis ramp when both directions differ equally so bridge
+        # spans and doorway transitions keep a stable left-to-right slope.
+        for _block_y in range(SUBVOXEL_SCALE):
             for block_x in range(SUBVOXEL_SCALE):
                 t = (block_x + 0.5) / SUBVOXEL_SCALE
                 level = round(start + (end - start) * t)
