@@ -88,6 +88,9 @@ class ParsedCell:
     layer_type: int
     quadrant_colors: tuple[Color, Color, Color, Color]
     block_colors: tuple[Color, ...]
+    block_coverage: tuple[int, ...]
+    block_top_rows: tuple[int, ...]
+    row_coverage: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -249,6 +252,9 @@ def parse_map(
         attributes = metatile_attributes(primary, secondary, metatile_id)
         behavior = attributes & METATILE_ATTR_BEHAVIOR_MASK
         layer_type = (attributes & METATILE_ATTR_LAYER_MASK) >> METATILE_ATTR_LAYER_SHIFT
+        quadrant_colors, block_colors, block_coverage, block_top_rows, row_coverage = (
+            composite_cell_metrics(primary, secondary, metatile_id)
+        )
         cells.append(
             ParsedCell(
                 x=x,
@@ -259,8 +265,11 @@ def parse_map(
                 behavior=behavior,
                 behavior_name=behavior_names.get(behavior, f"MB_UNKNOWN_{behavior:02X}"),
                 layer_type=layer_type,
-                quadrant_colors=composite_quadrant_colors(primary, secondary, metatile_id),
-                block_colors=composite_block_colors(primary, secondary, metatile_id),
+                quadrant_colors=quadrant_colors,
+                block_colors=block_colors,
+                block_coverage=block_coverage,
+                block_top_rows=block_top_rows,
+                row_coverage=row_coverage,
             )
         )
 
@@ -353,6 +362,77 @@ def composite_block_colors(
                         pixels.append(color)
             block_colors.append(average_color(pixels))
     return tuple(block_colors)
+
+
+def composite_cell_metrics(
+    primary: TilesetData,
+    secondary: TilesetData,
+    metatile_id: int,
+) -> tuple[
+    tuple[Color, Color, Color, Color],
+    tuple[Color, ...],
+    tuple[int, ...],
+    tuple[int, ...],
+    tuple[int, ...],
+]:
+    owner, local_id = metatile_owner(primary, secondary, metatile_id)
+    if local_id >= len(owner.metatiles):
+        empty_colors = ((0, 0, 0, 0),) * 4
+        empty_blocks = ((0, 0, 0, 0),) * 16
+        empty_metrics = (0,) * 16
+        empty_top_rows = (16,) * 16
+        empty_rows = (0,) * 16
+        return empty_colors, empty_blocks, empty_metrics, empty_top_rows, empty_rows
+
+    entries = owner.metatiles[local_id]
+    pixels: list[Color] = []
+    for y in range(16):
+        for x in range(16):
+            pixels.append(composite_metatile_pixel(primary, secondary, entries, x, y) or (0, 0, 0, 0))
+
+    quadrant_colors: list[Color] = []
+    for quadrant in range(4):
+        start_x = (quadrant % 2) * 8
+        start_y = (quadrant // 2) * 8
+        samples = [
+            pixels[(start_y + py) * 16 + start_x + px]
+            for py in range(8)
+            for px in range(8)
+        ]
+        quadrant_colors.append(average_color(samples))
+
+    block_colors: list[Color] = []
+    block_coverage: list[int] = []
+    block_top_rows: list[int] = []
+    for block_y in range(4):
+        for block_x in range(4):
+            start_x = block_x * 4
+            start_y = block_y * 4
+            samples = [
+                pixels[(start_y + py) * 16 + start_x + px]
+                for py in range(4)
+                for px in range(4)
+            ]
+            block_colors.append(average_color(samples))
+            opaque_rows = [
+                start_y + py
+                for py in range(4)
+                if any(samples[py * 4 + px][3] for px in range(4))
+            ]
+            block_coverage.append(sum(1 for color in samples if color[3]))
+            block_top_rows.append(min(opaque_rows) if opaque_rows else 16)
+
+    row_coverage = tuple(
+        sum(1 for x in range(16) if pixels[y * 16 + x][3])
+        for y in range(16)
+    )
+    return (
+        tuple(quadrant_colors),  # type: ignore[return-value]
+        tuple(block_colors),
+        tuple(block_coverage),
+        tuple(block_top_rows),
+        row_coverage,
+    )
 
 
 def metatile_owner(

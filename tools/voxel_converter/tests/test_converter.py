@@ -38,6 +38,9 @@ class VoxelConverterTests(unittest.TestCase):
         self.assertEqual(len(parsed.cells), 400)
         self.assertTrue(any(cell.behavior_name.startswith("MB_") for cell in parsed.cells))
         self.assertTrue(all(len(cell.block_colors) == 16 for cell in parsed.cells))
+        self.assertTrue(all(len(cell.block_coverage) == 16 for cell in parsed.cells))
+        self.assertTrue(all(len(cell.block_top_rows) == 16 for cell in parsed.cells))
+        self.assertTrue(all(len(cell.row_coverage) == 16 for cell in parsed.cells))
 
     def test_generate_subvoxel_heights_for_buildings_and_multi_level_maps(self) -> None:
         behavior_materials = load_behavior_material_names(
@@ -92,6 +95,19 @@ class VoxelConverterTests(unittest.TestCase):
         stair_heights = block_top_heights(route108, 29, 6)
         self.assertGreater(len(set(stair_heights)), 1)
         self.assertGreater(max(stair_heights), min(stair_heights))
+
+    def test_building_fronts_fold_north_rows_into_raised_facades(self) -> None:
+        behavior_materials = load_behavior_material_names(
+            self.repo_root / "tools/voxel_converter/behavior_map.json"
+        )
+        littleroot = generate_voxel_model(
+            parse_map(self.repo_root, "LittlerootTown"),
+            behavior_materials,
+        )
+        self.assertGreater(cell_top_height(littleroot, 5, 8), 10)
+        self.assertFalse(cell_has_voxels(littleroot, 5, 7))
+        self.assertFalse(cell_has_voxels(littleroot, 5, 6))
+        self.assertIn("building", littleroot.metadata["shape_counts"])
 
     def test_exporters_and_cli(self) -> None:
         model = VoxelModel(
@@ -153,6 +169,14 @@ def block_top_heights(model: VoxelModel, cell_x: int, cell_y: int) -> list[int]:
         for y in range(SUBVOXEL_SCALE)
         for x in range(SUBVOXEL_SCALE)
     ]
+
+
+def cell_has_voxels(model: VoxelModel, cell_x: int, cell_y: int) -> bool:
+    return any(
+        cell_x * SUBVOXEL_SCALE <= voxel.x < cell_x * SUBVOXEL_SCALE + SUBVOXEL_SCALE
+        and cell_y * SUBVOXEL_SCALE <= voxel.y < cell_y * SUBVOXEL_SCALE + SUBVOXEL_SCALE
+        for voxel in model.voxels
+    )
 
 
 if __name__ == "__main__":
