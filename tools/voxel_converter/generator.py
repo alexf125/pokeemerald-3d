@@ -511,10 +511,21 @@ def build_building_voxels(
         world_y = cell.y * SUBVOXEL_SCALE + (block_index // SUBVOXEL_SCALE)
         for layer_index in range(target_layers):
             source = source_bands[min(layer_index, len(source_bands) - 1)]
-            if source.block_coverage[block_index] == 0:
-                continue
+            if source.block_coverage[block_index] > 0:
+                color = material_color(spec, source.block_colors[block_index])
+            else:
+                # Band has a transparent pixel at this position; borrow the
+                # color from the first band that does have coverage so the
+                # building column stays solid with no holes.
+                fallback: Color | None = None
+                for band in source_bands:
+                    if band.block_coverage[block_index] > 0:
+                        fallback = material_color(spec, band.block_colors[block_index])
+                        break
+                if fallback is None:
+                    continue
+                color = fallback
             z = base_height + layer_index
-            color = material_color(spec, source.block_colors[block_index])
             if layer_index == target_layers - 1 and profile.span[1] > profile.span[0]:
                 span_radius = max(1.0, (world_end - world_start) / 2)
                 distance = abs(world_x - world_center)
