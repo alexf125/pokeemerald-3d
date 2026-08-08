@@ -449,7 +449,7 @@ def decode_indexed_png(path: Path) -> tuple[int, int, list[int]]:
         else:
             for byte in unfiltered:
                 pixels.append(byte >> 4)
-                if len(pixels) % width == 0:
+                if width % 2 == 1 and len(pixels) % width == 0:
                     continue
                 pixels.append(byte & 0x0F)
     return width, height, pixels[: width * height]

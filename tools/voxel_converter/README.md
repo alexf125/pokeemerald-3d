@@ -68,6 +68,7 @@ Unmapped behaviors fall back to:
 
 - `.vox` — MagicaVoxel-compatible palette voxels
 - `.gltf` — glTF 2.0 with vertex colors and material alpha for water/ice
+- `.glb` — binary glTF variant for direct viewer loading
 - `.json` — full debug dump of parsed voxel output
 
 ## Adding new behavior mappings
