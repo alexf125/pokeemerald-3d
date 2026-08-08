@@ -87,6 +87,7 @@ class ParsedCell:
     behavior_name: str
     layer_type: int
     quadrant_colors: tuple[Color, Color, Color, Color]
+    block_colors: tuple[Color, ...]
 
 
 @dataclass(frozen=True)
@@ -259,6 +260,7 @@ def parse_map(
                 behavior_name=behavior_names.get(behavior, f"MB_UNKNOWN_{behavior:02X}"),
                 layer_type=layer_type,
                 quadrant_colors=composite_quadrant_colors(primary, secondary, metatile_id),
+                block_colors=composite_block_colors(primary, secondary, metatile_id),
             )
         )
 
@@ -328,6 +330,31 @@ def composite_quadrant_colors(
     return tuple(quadrant_colors)  # type: ignore[return-value]
 
 
+def composite_block_colors(
+    primary: TilesetData,
+    secondary: TilesetData,
+    metatile_id: int,
+) -> tuple[Color, ...]:
+    owner, local_id = metatile_owner(primary, secondary, metatile_id)
+    if local_id >= len(owner.metatiles):
+        return ((0, 0, 0, 0),) * 16
+
+    entries = owner.metatiles[local_id]
+    block_colors: list[Color] = []
+    for block_y in range(4):
+        for block_x in range(4):
+            pixels: list[Color] = []
+            start_x = block_x * 4
+            start_y = block_y * 4
+            for py in range(start_y, start_y + 4):
+                for px in range(start_x, start_x + 4):
+                    color = composite_metatile_pixel(primary, secondary, entries, px, py)
+                    if color is not None:
+                        pixels.append(color)
+            block_colors.append(average_color(pixels))
+    return tuple(block_colors)
+
+
 def metatile_owner(
     primary: TilesetData,
     secondary: TilesetData,
@@ -336,6 +363,22 @@ def metatile_owner(
     if metatile_id < NUM_TILES_IN_PRIMARY:
         return primary, metatile_id
     return secondary, metatile_id - NUM_TILES_IN_PRIMARY
+
+
+def composite_metatile_pixel(
+    primary: TilesetData,
+    secondary: TilesetData,
+    entries: tuple[int, ...],
+    x: int,
+    y: int,
+) -> Color | None:
+    quadrant = (y // 8) * 2 + (x // 8)
+    local_x = x % 8
+    local_y = y % 8
+    color = sample_tile_entry(primary, secondary, entries[4 + quadrant], local_x, local_y)
+    if color is None:
+        color = sample_tile_entry(primary, secondary, entries[quadrant], local_x, local_y)
+    return color
 
 
 def sample_tile_entry(
