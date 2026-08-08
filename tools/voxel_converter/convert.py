@@ -89,7 +89,7 @@ def main(argv: list[str] | None = None) -> int:
 
 def normalize_formats(formats: list[str]) -> list[str]:
     if "all" in formats:
-        return ["vox", "gltf", "json"]
+        return ["vox", "gltf", "glb", "json"]
     deduped: list[str] = []
     for item in formats:
         if item not in deduped:

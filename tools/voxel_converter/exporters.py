@@ -182,12 +182,15 @@ def build_gltf_document(model: VoxelModel, embed_binary: bool) -> tuple[dict[str
     return document, bytes(buffers)
 
 
+MeshData = dict[str, list[float] | list[int]]
+
+
 def build_mesh_by_material(
     model: VoxelModel,
     materials: dict[str, MaterialSpec],
-) -> dict[str, dict[str, list[float] | list[int] | list[float]]]:
+) -> dict[str, MeshData]:
     occupancy = {(voxel.x, voxel.y, voxel.z): voxel for voxel in model.voxels}
-    mesh_by_material: dict[str, dict[str, list[float] | list[int] | list[float]]] = {
+    mesh_by_material: dict[str, MeshData] = {
         name: {
             "positions": [],
             "normals": [],

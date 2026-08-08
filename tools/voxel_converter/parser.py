@@ -127,7 +127,12 @@ def parse_behavior_definitions(header_path: Path) -> dict[str, int]:
             break
         if not line:
             continue
-        name = line.rstrip(",")
+        entry = line.rstrip(",")
+        if "=" in entry:
+            name, assigned = (part.strip() for part in entry.split("=", 1))
+            value = int(assigned, 0)
+        else:
+            name = entry
         result[name] = value
         value += 1
     return result
