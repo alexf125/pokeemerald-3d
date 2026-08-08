@@ -126,6 +126,7 @@ class VoxelConverterTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             self.assertTrue((tempdir_path / "LittlerootTown.json").exists())
 
+
 def cell_top_height(model: VoxelModel, cell_x: int, cell_y: int) -> int:
     return max(block_top_heights(model, cell_x, cell_y))
 

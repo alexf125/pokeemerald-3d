@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .parser import Color, ParsedMap
+from .parser import Color, ParsedCell, ParsedMap
 
 DEFAULT_BEHAVIOR_MATERIAL = "ground"
 ELEVATION_TRANSITION = 0
@@ -67,8 +67,8 @@ def generate_voxel_model(
         )
         for cell in parsed_map.cells
     }
-    resolved_elevations = resolve_elevations(parsed_map, materials_by_cell)
     cells_by_pos = {(cell.x, cell.y): cell for cell in parsed_map.cells}
+    resolved_elevations = resolve_elevations(parsed_map, materials_by_cell, cells_by_pos)
 
     for cell in parsed_map.cells:
         material_name = materials_by_cell[(cell.x, cell.y)]
@@ -144,13 +144,16 @@ def material_color(spec: MaterialSpec, source_color: Color) -> Color:
 def resolve_elevations(
     parsed_map: ParsedMap,
     materials_by_cell: dict[tuple[int, int], str],
+    cells_by_pos: dict[tuple[int, int], ParsedCell],
 ) -> dict[tuple[int, int], int]:
-    cells_by_pos = {(cell.x, cell.y): cell for cell in parsed_map.cells}
     resolved: dict[tuple[int, int], int] = {}
     for cell in parsed_map.cells:
         if cell.elevation not in (ELEVATION_TRANSITION, ELEVATION_MULTI_LEVEL):
             resolved[(cell.x, cell.y)] = cell.elevation
 
+    # Three passes are enough for the local transition patterns used in these
+    # maps because stairs, ladders, doors, and bridge joins only need to inherit
+    # nearby elevations from immediately adjacent tiles.
     for _ in range(3):
         changed = False
         for cell in parsed_map.cells:
@@ -181,9 +184,9 @@ def resolve_elevations(
 
 
 def build_block_heights(
-    cell,
+    cell: ParsedCell,
     parsed_map: ParsedMap,
-    cells_by_pos: dict[tuple[int, int], object],
+    cells_by_pos: dict[tuple[int, int], ParsedCell],
     materials_by_cell: dict[tuple[int, int], str],
     resolved_elevations: dict[tuple[int, int], int],
     elevation_scale: int,
@@ -202,7 +205,7 @@ def build_block_heights(
 def neighboring_levels(
     x: int,
     y: int,
-    cells_by_pos: dict[tuple[int, int], object],
+    cells_by_pos: dict[tuple[int, int], ParsedCell],
     resolved_elevations: dict[tuple[int, int], int],
 ) -> list[int]:
     levels: list[int] = []
@@ -221,7 +224,7 @@ def neighboring_levels(
 def directional_levels(
     x: int,
     y: int,
-    cells_by_pos: dict[tuple[int, int], object],
+    cells_by_pos: dict[tuple[int, int], ParsedCell],
     resolved_elevations: dict[tuple[int, int], int],
 ) -> dict[str, int]:
     levels: dict[str, int] = {}
@@ -237,7 +240,7 @@ def directional_levels(
 
 
 def inherited_level(
-    cell,
+    cell: ParsedCell,
     materials_by_cell: dict[tuple[int, int], str],
     neighbor_levels: list[int],
 ) -> int | None:
@@ -265,7 +268,7 @@ def dominant_level(levels: list[int]) -> int | None:
 
 
 def should_ramp(
-    cell,
+    cell: ParsedCell,
     material_name: str,
     neighbor_levels: dict[str, int],
 ) -> bool:
