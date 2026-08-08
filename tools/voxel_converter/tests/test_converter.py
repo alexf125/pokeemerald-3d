@@ -109,6 +109,39 @@ class VoxelConverterTests(unittest.TestCase):
         self.assertFalse(cell_has_voxels(littleroot, 5, 6))
         self.assertIn("building", littleroot.metadata["shape_counts"])
 
+    def test_building_columns_are_solid_with_no_missing_layers(self) -> None:
+        behavior_materials = load_behavior_material_names(
+            self.repo_root / "tools/voxel_converter/behavior_map.json"
+        )
+        littleroot = generate_voxel_model(
+            parse_map(self.repo_root, "LittlerootTown"),
+            behavior_materials,
+        )
+        # The building cell at (5, 8) is a known building front in LittlerootTown.
+        # Every sub-voxel column inside that cell must be a contiguous z-stack
+        # with no missing layers.
+        building_cell_x, building_cell_y = 5, 8
+        columns: dict[tuple[int, int], list[int]] = defaultdict(list)
+        for voxel in littleroot.voxels:
+            if (
+                building_cell_x * SUBVOXEL_SCALE
+                <= voxel.x
+                < building_cell_x * SUBVOXEL_SCALE + SUBVOXEL_SCALE
+                and building_cell_y * SUBVOXEL_SCALE
+                <= voxel.y
+                < building_cell_y * SUBVOXEL_SCALE + SUBVOXEL_SCALE
+            ):
+                columns[(voxel.x, voxel.y)].append(voxel.z)
+        self.assertGreater(len(columns), 0, "Expected building voxels at (5, 8)")
+        for (wx, wy), zs in columns.items():
+            zs_sorted = sorted(zs)
+            expected = list(range(zs_sorted[0], zs_sorted[-1] + 1))
+            self.assertEqual(
+                zs_sorted,
+                expected,
+                f"Gap in building column at world ({wx}, {wy}): {zs_sorted}",
+            )
+
     def test_exporters_and_cli(self) -> None:
         model = VoxelModel(
             map_name="UnitTestMap",
