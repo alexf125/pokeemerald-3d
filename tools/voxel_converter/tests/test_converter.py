@@ -3,12 +3,18 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from collections import defaultdict
 from pathlib import Path
 
 from tools.voxel_converter.convert import main as convert_main
 from tools.voxel_converter.exporters import export_glb, export_gltf, export_json, export_vox
-from tools.voxel_converter.generator import Voxel, VoxelModel
-from tools.voxel_converter.parser import find_repo_root, parse_behavior_definitions, parse_map
+from tools.voxel_converter.generator import Voxel, VoxelModel, generate_voxel_model
+from tools.voxel_converter.parser import (
+    find_repo_root,
+    load_behavior_material_names,
+    parse_behavior_definitions,
+    parse_map,
+)
 
 
 class VoxelConverterTests(unittest.TestCase):
@@ -31,6 +37,54 @@ class VoxelConverterTests(unittest.TestCase):
         self.assertEqual(parsed.height, 20)
         self.assertEqual(len(parsed.cells), 400)
         self.assertTrue(any(cell.behavior_name.startswith("MB_") for cell in parsed.cells))
+        self.assertTrue(all(len(cell.block_colors) == 16 for cell in parsed.cells))
+
+    def test_generate_subvoxel_heights_for_buildings_and_multi_level_maps(self) -> None:
+        behavior_materials = load_behavior_material_names(
+            self.repo_root / "tools/voxel_converter/behavior_map.json"
+        )
+
+        littleroot = generate_voxel_model(
+            parse_map(self.repo_root, "LittlerootTown"),
+            behavior_materials,
+        )
+        self.assertEqual(littleroot.size_x, 80)
+        self.assertEqual(littleroot.size_y, 80)
+        self.assertGreater(
+            cell_top_height(littleroot, 5, 8),
+            cell_top_height(littleroot, 5, 7),
+        )
+
+        sootopolis = generate_voxel_model(
+            parse_map(self.repo_root, "SootopolisCity"),
+            behavior_materials,
+        )
+        self.assertGreater(
+            cell_top_height(sootopolis, 31, 33),
+            cell_top_height(sootopolis, 31, 41),
+        )
+
+        fortree = generate_voxel_model(
+            parse_map(self.repo_root, "FortreeCity"),
+            behavior_materials,
+        )
+        self.assertNotEqual(
+            cell_top_height(fortree, 30, 14),
+            cell_top_height(fortree, 29, 14),
+        )
+        self.assertLess(cell_top_height(fortree, 30, 14), 12)
+
+    def test_generate_gradual_stair_heights(self) -> None:
+        behavior_materials = load_behavior_material_names(
+            self.repo_root / "tools/voxel_converter/behavior_map.json"
+        )
+        route108 = generate_voxel_model(
+            parse_map(self.repo_root, "Route108"),
+            behavior_materials,
+        )
+        stair_heights = block_top_heights(route108, 29, 6)
+        self.assertGreater(len(set(stair_heights)), 1)
+        self.assertGreater(max(stair_heights), min(stair_heights))
 
     def test_exporters_and_cli(self) -> None:
         model = VoxelModel(
@@ -71,6 +125,19 @@ class VoxelConverterTests(unittest.TestCase):
             )
             self.assertEqual(exit_code, 0)
             self.assertTrue((tempdir_path / "LittlerootTown.json").exists())
+
+def cell_top_height(model: VoxelModel, cell_x: int, cell_y: int) -> int:
+    return max(block_top_heights(model, cell_x, cell_y))
+
+
+def block_top_heights(model: VoxelModel, cell_x: int, cell_y: int) -> list[int]:
+    tops: dict[tuple[int, int], int] = defaultdict(lambda: -1)
+    for voxel in model.voxels:
+        if cell_x * 4 <= voxel.x < cell_x * 4 + 4 and cell_y * 4 <= voxel.y < cell_y * 4 + 4:
+            local_x = voxel.x - cell_x * 4
+            local_y = voxel.y - cell_y * 4
+            tops[(local_x, local_y)] = max(tops[(local_x, local_y)], voxel.z)
+    return [tops[(x, y)] for y in range(4) for x in range(4)]
 
 
 if __name__ == "__main__":

@@ -17,14 +17,22 @@ layout data into simple voxel geometry for inspection and browser preview.
 
 The current repo stores metatiles as **8 tile entries per metatile**: 4 bottom
 layer tiles plus 4 top layer tiles. The converter composites the visible top
-quadrants from those two layers and emits **2×2 voxel columns per metatile**.
+pixels from those two layers and emits **4×4 voxel columns per metatile** so
+each exported tile keeps sub-voxel color detail.
 
-Voxel height uses the map block elevation field with the Phase 1 scale:
+Voxel height combines map block elevation, metatile behavior, and local tile
+context:
 
-- `voxel_height = elevation * 2`
+- regular elevation levels are scaled as `voxel_height = elevation * 2`
+- `ELEVATION_MULTI_LEVEL` tiles inherit nearby walkable heights instead of
+  becoming giant spikes
+- building/door/covered tiles inherit nearby raised ground so structures render
+  above the terrain rather than as depressions
+- stair/ladder/escalator behaviors can emit a per-block height ramp across the
+  tile
 
-The generator keeps one visible surface voxel even at elevation `0`, so flat
-ground still appears in exported models.
+The generator still keeps one visible surface voxel even at ground level so
+flat terrain remains visible in exported models.
 
 ## Usage
 
