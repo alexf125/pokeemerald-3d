@@ -1,0 +1,1562 @@
+#if WASM
+
+#include "global.h"
+#include "constants/map_types.h"
+#include "gba/defines.h"
+#include "gba/io_reg.h"
+#include "main.h"
+#include "overworld.h"
+#include "field_camera.h"
+#include "fieldmap.h"
+#include "sprite.h"
+
+extern u32 WasmOamCount(void);
+extern u32 WasmOamSpriteId(u32 oamIndex);
+extern s32 WasmOamScreenX(u32 oamIndex);
+extern s32 WasmOamScreenY(u32 oamIndex);
+extern u32 WasmTilesetAnimationFrame(bool8 secondary);
+extern void WasmApplyTilesetAnimations(const struct Tileset *tileset, u8 *dest, u16 *palettes,
+                                        u16 *displayPalettes, u32 firstFrame, u32 lastFrame);
+
+#define DISPLAY_WIDTH 240
+#define DISPLAY_HEIGHT 160
+#define DISPLAY_PIXELS (DISPLAY_WIDTH * DISPLAY_HEIGHT)
+#define HD2D_WORLD_WIDTH 800
+#define HD2D_WORLD_HEIGHT 768
+#define HD2D_WORLD_PIXELS (HD2D_WORLD_WIDTH * HD2D_WORLD_HEIGHT)
+#define HD2D_TILE_WIDTH 8
+#define HD2D_SAMPLE_COLS (HD2D_WORLD_WIDTH / 16 + 2)
+#define HD2D_SAMPLE_ROWS (HD2D_WORLD_HEIGHT / 16 + 2)
+#define HD2D_WORLD_OFFSET_X ((HD2D_WORLD_WIDTH - DISPLAY_WIDTH) / 2)
+#define HD2D_WORLD_OFFSET_Y ((HD2D_WORLD_HEIGHT - DISPLAY_HEIGHT) / 2)
+#define RGBA_CHANNELS 4
+#define OBJECT_SOURCE_SIZE 64
+#define OBJECT_DESCRIPTOR_WORDS 16
+#define OAM_ENTRY_COUNT 128
+
+#define LAYER_BG0 0x01
+#define LAYER_BG1 0x02
+#define LAYER_BG2 0x04
+#define LAYER_BG3 0x08
+#define LAYER_OBJ 0x10
+#define LAYER_BACKDROP 0x20
+#define WINDOW_ALL_LAYERS 0x3f
+
+#define REG_OFFSET_DMA0 0xb0
+#define DMA_REG_SIZE 12
+#define DMA_DEST_MASK 0x0060
+#define DMA_DEST_FIXED 0x0040
+#define DMA_DEST_RELOAD 0x0060
+#define DMA_SRC_MASK 0x0180
+#define DMA_SRC_DEC 0x0080
+#define DMA_SRC_FIXED 0x0100
+#define DMA_REPEAT 0x0200
+#define DMA_32BIT 0x0400
+#define DMA_START_HBLANK 0x2000
+#define DMA_START_MASK 0x3000
+#define DMA_ENABLE 0x8000
+#define GPU_REG_U16_COUNT (REG_OFFSET_DMA0 / 2)
+
+struct Rgb
+{
+    u8 r;
+    u8 g;
+    u8 b;
+};
+
+struct HblankDmaGpuReg
+{
+    bool8 active;
+    u32 src;
+    s32 stride;
+};
+
+struct BgLayer
+{
+    u8 bg;
+    u8 type;
+};
+
+static bool8 sWasmHd2dEnabled;
+static u8 sWasmDisplayRgba[DISPLAY_PIXELS * RGBA_CHANNELS];
+static u8 sWasmWorldRgba[HD2D_WORLD_PIXELS * RGBA_CHANNELS];
+static u8 sWasmWorldLayerData[HD2D_WORLD_PIXELS];
+static u8 sWasmBgPriorityData[HD2D_WORLD_PIXELS];
+static s8 sWasmWorldHeightData[HD2D_WORLD_PIXELS];
+static s32 sWasmWorldPixelOriginX;
+static s32 sWasmWorldPixelOriginY;
+static u8 sWasmObjectRgba[DISPLAY_PIXELS * RGBA_CHANNELS];
+static u8 sWasmObjectIdData[DISPLAY_PIXELS];
+static u8 sObjectSourceRgba[128 * OBJECT_SOURCE_SIZE * OBJECT_SOURCE_SIZE * RGBA_CHANNELS];
+static s32 sObjectDescriptors[128 * OBJECT_DESCRIPTOR_WORDS];
+static u32 sObjectSourceCount;
+static u8 sLayerData[DISPLAY_PIXELS];
+static u8 sObjectIdData[DISPLAY_PIXELS];
+static s16 sObjectAnchors[128 * 2];
+static u8 sObjectPriorities[128];
+static u8 sCurrentObjectId;
+static bool8 sRenderingObjectPass;
+static struct HblankDmaGpuReg sHblankDmaGpuRegs[GPU_REG_U16_COUNT];
+
+static inline u8 *Ptr8(u32 address)
+{
+    return (u8 *)address;
+}
+
+static inline u16 *Ptr16(u32 address)
+{
+    return (u16 *)address;
+}
+
+static inline u16 ReadU16(u32 address)
+{
+    return *Ptr16(address);
+}
+
+static inline u32 ReadU32(u32 address)
+{
+    return ((u32)ReadU16(address)) | ((u32)ReadU16(address + 2) << 16);
+}
+
+static inline s16 Signed16(u16 value)
+{
+    return (s16)value;
+}
+
+static inline s32 Signed28(u32 value)
+{
+    return ((s32)(value << 4)) >> 4;
+}
+
+static inline u32 Word(u32 offset)
+{
+    return ReadU32(REG_BASE + offset);
+}
+
+static inline u8 ClampBlend(u32 value)
+{
+    return value > 255 ? 255 : value;
+}
+
+static inline struct Rgb GbaColor(u16 value)
+{
+    struct Rgb color;
+    color.r = (u8)((value & 31) * 255 / 31);
+    color.g = (u8)(((value >> 5) & 31) * 255 / 31);
+    color.b = (u8)(((value >> 10) & 31) * 255 / 31);
+    return color;
+}
+
+static bool8 InWindowRange(u8 value, u16 range)
+{
+    const u8 start = range >> 8;
+    const u8 end = range & 0xff;
+
+    return start <= end ? value >= start && value < end : value >= start || value < end;
+}
+
+static void RefreshHblankDmaGpuRegs(void)
+{
+    u32 i;
+
+    for (i = 0; i < GPU_REG_U16_COUNT; i++)
+        sHblankDmaGpuRegs[i].active = FALSE;
+
+    for (u32 channel = 0; channel < 4; channel++)
+    {
+        const u32 dma = REG_BASE + REG_OFFSET_DMA0 + channel * DMA_REG_SIZE;
+        const u16 control = ReadU16(dma + 10);
+        u16 destMode;
+        u16 srcMode;
+        u32 dest;
+        s32 offset;
+
+        if (!(control & DMA_ENABLE)
+         || !(control & DMA_REPEAT)
+         || (control & DMA_START_MASK) != DMA_START_HBLANK
+         || (control & DMA_32BIT)
+         || ReadU16(dma + 8) != 1)
+            continue;
+
+        destMode = control & DMA_DEST_MASK;
+        if (destMode != DMA_DEST_FIXED && destMode != DMA_DEST_RELOAD)
+            continue;
+
+        dest = ReadU32(dma + 4);
+        offset = (s32)(dest - REG_BASE);
+        if (offset < 0 || offset >= REG_OFFSET_DMA0 || (offset & 1))
+            continue;
+        if (sHblankDmaGpuRegs[offset >> 1].active)
+            continue;
+
+        srcMode = control & DMA_SRC_MASK;
+        sHblankDmaGpuRegs[offset >> 1].active = TRUE;
+        sHblankDmaGpuRegs[offset >> 1].src = ReadU32(dma);
+        sHblankDmaGpuRegs[offset >> 1].stride = srcMode == DMA_SRC_FIXED ? 0 : srcMode == DMA_SRC_DEC ? -2 : 2;
+    }
+}
+
+static u16 ScanlineGpuReg(u32 offset, u8 y)
+{
+    struct HblankDmaGpuReg *dma;
+
+    if (offset < REG_OFFSET_DMA0)
+    {
+        dma = &sHblankDmaGpuRegs[offset >> 1];
+        if (dma->active && y > 0)
+        {
+            const u32 ptr = dma->src + dma->stride * (y - 1);
+            return ReadU16(ptr);
+        }
+    }
+
+    return ReadU16(REG_BASE + offset);
+}
+
+static u8 WindowMask(u8 x, u8 y)
+{
+    const u16 dispcnt = REG_DISPCNT;
+    const u16 windowsEnabled = dispcnt & 0xe000;
+
+    if (!windowsEnabled)
+        return WINDOW_ALL_LAYERS;
+
+    if ((dispcnt & 0x2000)
+     && InWindowRange(x, ScanlineGpuReg(REG_OFFSET_WIN0H, y))
+     && InWindowRange(y, REG_WIN0V))
+        return REG_WININ & WINDOW_ALL_LAYERS;
+
+    if ((dispcnt & 0x4000)
+     && InWindowRange(x, ScanlineGpuReg(REG_OFFSET_WIN1H, y))
+     && InWindowRange(y, REG_WIN1V))
+        return (REG_WININ >> 8) & WINDOW_ALL_LAYERS;
+
+    return REG_WINOUT & WINDOW_ALL_LAYERS;
+}
+
+static struct Rgb ActiveBlendColor(struct Rgb color, u8 layer, u32 pixel, bool8 effectsEnabled, u8 y, bool8 forceAlphaBlend)
+{
+    const u16 bldcnt = REG_BLDCNT;
+    const u8 effect = (bldcnt >> 6) & 3;
+    const u8 sourceTargets = bldcnt & WINDOW_ALL_LAYERS;
+    const bool8 isSourceTarget = (sourceTargets & layer) || (forceAlphaBlend && effect == 1);
+    u8 evy;
+
+    if ((!effectsEnabled && !(forceAlphaBlend && effect == 1)) || !isSourceTarget || effect == 0)
+        return color;
+
+    if (effect == 1 && ((bldcnt >> 8) & sLayerData[pixel]))
+    {
+        const u16 alpha = REG_BLDALPHA;
+        const u8 eva = (alpha & 0x1f) > 16 ? 16 : alpha & 0x1f;
+        const u8 evb = ((alpha >> 8) & 0x1f) > 16 ? 16 : (alpha >> 8) & 0x1f;
+        struct Rgb blended;
+        const u32 p = pixel * RGBA_CHANNELS;
+
+        blended.r = ClampBlend(((u32)color.r * eva + (u32)sWasmDisplayRgba[p] * evb) >> 4);
+        blended.g = ClampBlend(((u32)color.g * eva + (u32)sWasmDisplayRgba[p + 1] * evb) >> 4);
+        blended.b = ClampBlend(((u32)color.b * eva + (u32)sWasmDisplayRgba[p + 2] * evb) >> 4);
+        return blended;
+    }
+
+    evy = ScanlineGpuReg(REG_OFFSET_BLDY, y) & 0x1f;
+    if (evy > 16)
+        evy = 16;
+
+    if (effect == 2)
+    {
+        color.r = color.r + (((255 - color.r) * evy) >> 4);
+        color.g = color.g + (((255 - color.g) * evy) >> 4);
+        color.b = color.b + (((255 - color.b) * evy) >> 4);
+    }
+    else if (effect == 3)
+    {
+        color.r = color.r - ((color.r * evy) >> 4);
+        color.g = color.g - ((color.g * evy) >> 4);
+        color.b = color.b - ((color.b * evy) >> 4);
+    }
+
+    return color;
+}
+
+static void PutPixel(s32 x, s32 y, struct Rgb color, u8 layer, bool8 forceAlphaBlend)
+{
+    u8 mask;
+    u32 pixel;
+    u32 p;
+
+    if (x < 0 || y < 0 || x >= DISPLAY_WIDTH || y >= DISPLAY_HEIGHT)
+        return;
+
+    mask = WindowMask(x, y);
+    if (layer != LAYER_BACKDROP && !(mask & layer))
+        return;
+
+    pixel = y * DISPLAY_WIDTH + x;
+    const bool8 rawAlpha = sRenderingObjectPass && layer == LAYER_OBJ
+                        && (REG_BLDCNT & (3 << 6)) == BLDCNT_EFFECT_BLEND
+                        && (forceAlphaBlend || (REG_BLDCNT & BLDCNT_TGT1_OBJ));
+    if (!rawAlpha)
+        color = ActiveBlendColor(color, layer, pixel, mask & LAYER_BACKDROP, y, forceAlphaBlend);
+    p = pixel * RGBA_CHANNELS;
+    sWasmDisplayRgba[p] = color.r;
+    sWasmDisplayRgba[p + 1] = color.g;
+    sWasmDisplayRgba[p + 2] = color.b;
+    if (rawAlpha)
+    {
+        const u8 eva = (REG_BLDALPHA & 0x1f) > 16 ? 16 : REG_BLDALPHA & 0x1f;
+        sWasmDisplayRgba[p + 3] = eva * 255 / 16;
+    }
+    else
+        sWasmDisplayRgba[p + 3] = 255;
+    sLayerData[pixel] = layer;
+    sObjectIdData[pixel] = layer == LAYER_OBJ ? sCurrentObjectId : 0xff;
+}
+
+static void ClearScreen(void)
+{
+    const struct Rgb color = GbaColor(ReadU16(BG_PLTT));
+
+    for (u32 y = 0; y < DISPLAY_HEIGHT; y++)
+        for (u32 x = 0; x < DISPLAY_WIDTH; x++)
+            PutPixel(x, y, color, LAYER_BACKDROP, FALSE);
+}
+
+static void ClearTransparent(void)
+{
+    for (u32 i = 0; i < DISPLAY_PIXELS; i++)
+    {
+        const u32 p = i * RGBA_CHANNELS;
+        sWasmDisplayRgba[p] = 0;
+        sWasmDisplayRgba[p + 1] = 0;
+        sWasmDisplayRgba[p + 2] = 0;
+        sWasmDisplayRgba[p + 3] = 0;
+        sLayerData[i] = LAYER_BACKDROP;
+        sObjectIdData[i] = 0xff;
+    }
+}
+
+static void RenderBitmapMode3(void)
+{
+    for (u32 i = 0; i < DISPLAY_PIXELS; i++)
+    {
+        const struct Rgb color = GbaColor(ReadU16(VRAM + i * 2));
+        const u32 p = i * RGBA_CHANNELS;
+        sWasmDisplayRgba[p] = color.r;
+        sWasmDisplayRgba[p + 1] = color.g;
+        sWasmDisplayRgba[p + 2] = color.b;
+        sWasmDisplayRgba[p + 3] = 255;
+        sLayerData[i] = LAYER_BG2;
+        sObjectIdData[i] = 0xff;
+    }
+}
+
+static void RenderBitmapMode4(u16 dispcnt)
+{
+    const u32 page = dispcnt & 0x10 ? 0xA000 : 0;
+
+    for (u32 i = 0; i < DISPLAY_PIXELS; i++)
+    {
+        const u8 colorIndex = *Ptr8(VRAM + page + i);
+        const struct Rgb color = GbaColor(ReadU16(PLTT + colorIndex * 2));
+        const u32 p = i * RGBA_CHANNELS;
+        sWasmDisplayRgba[p] = color.r;
+        sWasmDisplayRgba[p + 1] = color.g;
+        sWasmDisplayRgba[p + 2] = color.b;
+        sWasmDisplayRgba[p + 3] = 255;
+        sLayerData[i] = LAYER_BG2;
+        sObjectIdData[i] = 0xff;
+    }
+}
+
+static bool8 TextBgPixel(u8 bg, s16 x, s16 y, struct Rgb *color)
+{
+    const u16 cnt = ReadU16(REG_BASE + REG_OFFSET_BG0CNT + bg * 2);
+    const u32 charBase = VRAM + ((cnt >> 2) & 3) * 0x4000;
+    const u32 screenBase = VRAM + ((cnt >> 8) & 31) * 0x800;
+    const bool8 color256 = (cnt & 0x80) != 0;
+    const u8 size = (cnt >> 14) & 3;
+    const u16 width = size & 1 ? 512 : 256;
+    const u16 height = size & 2 ? 512 : 256;
+    const u32 hofsOffset = REG_OFFSET_BG0HOFS + bg * 4;
+    const u8 scanlineY = y < 0 ? 0 : y >= DISPLAY_HEIGHT ? DISPLAY_HEIGHT - 1 : y;
+    const u16 hofs = ScanlineGpuReg(hofsOffset, scanlineY) & 511;
+    const u16 vofs = ScanlineGpuReg(hofsOffset + 2, scanlineY) & 511;
+    const u16 sx = (x + hofs) & (width - 1);
+    const u16 sy = (y + vofs) & (height - 1);
+    const u8 block = (sx >= 256 ? 1 : 0) + (sy >= 256 ? (size == 3 ? 2 : 1) : 0);
+    const u8 mapX = (sx & 255) >> 3;
+    const u8 mapY = (sy & 255) >> 3;
+    const u16 entry = ReadU16(screenBase + block * 0x800 + (mapY * 32 + mapX) * 2);
+    const u16 tile = entry & 0x3ff;
+    const u8 palette = (entry >> 12) & 15;
+    const u8 px = entry & 0x400 ? 7 - (sx & 7) : sx & 7;
+    const u8 py = entry & 0x800 ? 7 - (sy & 7) : sy & 7;
+    u8 colorIndex;
+
+    if (color256)
+    {
+        colorIndex = *Ptr8(charBase + tile * 64 + py * 8 + px);
+        if (!colorIndex)
+            return FALSE;
+        *color = GbaColor(ReadU16(PLTT + colorIndex * 2));
+        return TRUE;
+    }
+
+    {
+        const u8 packed = *Ptr8(charBase + tile * 32 + py * 4 + (px >> 1));
+        colorIndex = px & 1 ? packed >> 4 : packed & 15;
+    }
+    if (!colorIndex)
+        return FALSE;
+
+    *color = GbaColor(ReadU16(PLTT + (palette * 16 + colorIndex) * 2));
+    return TRUE;
+}
+
+static bool8 AffineBgPixel(u8 bg, u8 x, u8 y, struct Rgb *color)
+{
+    const u16 cnt = ReadU16(REG_BASE + REG_OFFSET_BG0CNT + bg * 2);
+    const u32 charBase = VRAM + ((cnt >> 2) & 3) * 0x4000;
+    const u32 screenBase = VRAM + ((cnt >> 8) & 31) * 0x800;
+    const u16 sizes[] = {128, 256, 512, 1024};
+    const u16 size = sizes[(cnt >> 14) & 3];
+    const bool8 wrap = (cnt & 0x2000) != 0;
+    const u8 reg = bg == 2 ? REG_OFFSET_BG2PA : REG_OFFSET_BG3PA;
+    const s16 pa = Signed16(ReadU16(REG_BASE + reg));
+    const s16 pb = Signed16(ReadU16(REG_BASE + reg + 2));
+    const s16 pc = Signed16(ReadU16(REG_BASE + reg + 4));
+    const s16 pd = Signed16(ReadU16(REG_BASE + reg + 6));
+    const s32 refX = Signed28(Word(reg + 8));
+    const s32 refY = Signed28(Word(reg + 12));
+    s32 sx = (refX + pa * x + pb * y) >> 8;
+    s32 sy = (refY + pc * x + pd * y) >> 8;
+    u16 tile;
+    u8 colorIndex;
+
+    if (wrap)
+    {
+        sx &= size - 1;
+        sy &= size - 1;
+    }
+    else if (sx < 0 || sy < 0 || sx >= size || sy >= size)
+    {
+        return FALSE;
+    }
+
+    tile = *Ptr8(screenBase + (sy >> 3) * (size >> 3) + (sx >> 3));
+    colorIndex = *Ptr8(charBase + tile * 64 + (sy & 7) * 8 + (sx & 7));
+    if (!colorIndex)
+        return FALSE;
+
+    *color = GbaColor(ReadU16(PLTT + colorIndex * 2));
+    return TRUE;
+}
+
+static u8 BgLayersForMode(u16 dispcnt, struct BgLayer *layers)
+{
+    const u8 mode = dispcnt & 7;
+    u8 count = 0;
+
+    for (u8 bg = 0; bg < 4; bg++)
+    {
+        if (!(dispcnt & (0x100 << bg)))
+            continue;
+
+        if (mode == 0)
+        {
+            layers[count].bg = bg;
+            layers[count].type = 0;
+            count++;
+        }
+        else if (mode == 1 && bg < 2)
+        {
+            layers[count].bg = bg;
+            layers[count].type = 0;
+            count++;
+        }
+        else if (mode == 1 && bg == 2)
+        {
+            layers[count].bg = bg;
+            layers[count].type = 1;
+            count++;
+        }
+        else if (mode == 2 && bg >= 2)
+        {
+            layers[count].bg = bg;
+            layers[count].type = 1;
+            count++;
+        }
+    }
+
+    return count;
+}
+
+static u16 ObjTileOffset(u16 tileBase, u8 tileX, u8 tileY, u8 width, bool8 color256, bool8 mapping1d)
+{
+    if (mapping1d)
+        return tileBase + tileY * (color256 ? width >> 2 : width >> 3) + tileX * (color256 ? 2 : 1);
+    return tileBase + tileY * 32 + tileX * (color256 ? 2 : 1);
+}
+
+static bool8 ObjPixel(u16 tileBase, u8 x, u8 y, u8 width, bool8 color256, u8 palette, bool8 mapping1d, struct Rgb *color)
+{
+    const u16 tileOffset = ObjTileOffset(tileBase, x >> 3, y >> 3, width, color256, mapping1d);
+    u8 colorIndex;
+
+    if (color256)
+    {
+        colorIndex = *Ptr8(VRAM + 0x10000 + tileOffset * 32 + (y & 7) * 8 + (x & 7));
+    }
+    else
+    {
+        const u8 packed = *Ptr8(VRAM + 0x10000 + tileOffset * 32 + (y & 7) * 4 + ((x & 7) >> 1));
+        colorIndex = x & 1 ? packed >> 4 : packed & 15;
+    }
+
+    if (!colorIndex)
+        return FALSE;
+
+    *color = GbaColor(ReadU16(OBJ_PLTT + (color256 ? colorIndex : palette * 16 + colorIndex) * 2));
+    return TRUE;
+}
+
+static void RenderBgLayer(u8 bg, u8 type)
+{
+    struct Rgb color;
+    const u8 layer = 1 << bg;
+
+    for (u32 y = 0; y < DISPLAY_HEIGHT; y++)
+    {
+        for (u32 x = 0; x < DISPLAY_WIDTH; x++)
+        {
+            const bool8 hasPixel = type ? AffineBgPixel(bg, x, y, &color) : TextBgPixel(bg, x, y, &color);
+            if (hasPixel)
+                PutPixel(x, y, color, layer, FALSE);
+        }
+    }
+}
+
+// The sprite engine emits a contiguous managed prefix with unwrapped logical
+// coordinates, but several classic screens also write hardware OAM directly
+// at fixed indices (including 64..127). Traverse all entries and only use the
+// logical metadata for that managed prefix.
+static s32 OamScreenX(u32 index, u16 attr1)
+{
+    s32 x;
+
+    if (index < WasmOamCount())
+        return WasmOamScreenX(index);
+    x = attr1 & 511;
+    return x > DISPLAY_WIDTH ? x - 512 : x;
+}
+
+static s32 OamScreenY(u32 index, u16 attr0)
+{
+    s32 y;
+
+    if (index < WasmOamCount())
+        return WasmOamScreenY(index);
+    y = attr0 & 255;
+    return y > DISPLAY_HEIGHT ? y - 256 : y;
+}
+
+static u32 OamSpriteId(u32 index)
+{
+    return index < WasmOamCount() ? WasmOamSpriteId(index) : 0xff;
+}
+
+static void RenderSprites(u16 dispcnt, s8 priority)
+{
+    const bool8 mapping1d = dispcnt & 0x40;
+    static const u8 sizes[3][4][2] = {
+        {{8, 8}, {16, 16}, {32, 32}, {64, 64}},
+        {{16, 8}, {32, 8}, {32, 16}, {64, 32}},
+        {{8, 16}, {8, 32}, {16, 32}, {32, 64}},
+    };
+    struct Rgb color;
+
+    if (!(dispcnt & 0x1000))
+        return;
+
+    for (s32 i = OAM_ENTRY_COUNT - 1; i >= 0; i--)
+    {
+        const u32 base = OAM + i * 8;
+        const u16 a0 = ReadU16(base);
+        const u16 a1 = ReadU16(base + 2);
+        const u16 a2 = ReadU16(base + 4);
+        const u8 affineMode = (a0 >> 8) & 3;
+        const u8 objMode = (a0 >> 10) & 3;
+        const bool8 forceAlphaBlend = objMode == 1;
+        const bool8 affine = affineMode & 1;
+        const u8 shape = (a0 >> 14) & 3;
+        const u8 spritePriority = (a2 >> 10) & 3;
+        const bool8 color256 = (a0 & 0x2000) != 0;
+        const u8 palette = (a2 >> 12) & 15;
+        const u16 tileBase = a2 & 0x3ff;
+        u8 w;
+        u8 h;
+        s32 ox;
+        s32 oy;
+
+        if (!affine && (a0 & 0x0200))
+            continue;
+        if (shape == 3)
+            continue;
+        if (priority >= 0 && spritePriority != priority)
+            continue;
+
+        sCurrentObjectId = i;
+        sObjectPriorities[i] = spritePriority;
+        w = sizes[shape][(a1 >> 14) & 3][0];
+        h = sizes[shape][(a1 >> 14) & 3][1];
+        ox = OamScreenX(i, a1);
+        oy = OamScreenY(i, a0);
+
+        sObjectAnchors[i * 2] = ox + (affine && affineMode == 3 ? w : w / 2);
+        sObjectAnchors[i * 2 + 1] = oy + h + (affine && affineMode == 3 ? h / 2 : 0);
+
+        if (affine)
+        {
+            const u8 matrix = (a1 >> 9) & 31;
+            const u32 matrixBase = OAM + matrix * 32;
+            const s16 pa = Signed16(ReadU16(matrixBase + 6));
+            const s16 pb = Signed16(ReadU16(matrixBase + 14));
+            const s16 pc = Signed16(ReadU16(matrixBase + 22));
+            const s16 pd = Signed16(ReadU16(matrixBase + 30));
+            const u16 drawW = affineMode == 3 ? w * 2 : w;
+            const u16 drawH = affineMode == 3 ? h * 2 : h;
+            const s32 drawCx = drawW / 2;
+            const s32 drawCy = drawH / 2;
+            const s32 texCx = w / 2;
+            const s32 texCy = h / 2;
+
+            for (u32 y = 0; y < drawH; y++)
+            {
+                for (u32 x = 0; x < drawW; x++)
+                {
+                    const s32 dx = (s32)x - drawCx;
+                    const s32 dy = (s32)y - drawCy;
+                    const s32 px = ((pa * dx + pb * dy) >> 8) + texCx;
+                    const s32 py = ((pc * dx + pd * dy) >> 8) + texCy;
+
+                    if (px < 0 || py < 0 || px >= w || py >= h)
+                        continue;
+                    if (ObjPixel(tileBase, px, py, w, color256, palette, mapping1d, &color))
+                        PutPixel(ox + x, oy + y, color, LAYER_OBJ, forceAlphaBlend);
+                }
+            }
+        }
+        else
+        {
+            for (u32 y = 0; y < h; y++)
+            {
+                for (u32 x = 0; x < w; x++)
+                {
+                    const u8 px = a1 & 0x1000 ? w - 1 - x : x;
+                    const u8 py = a1 & 0x2000 ? h - 1 - y : y;
+
+                    if (ObjPixel(tileBase, px, py, w, color256, palette, mapping1d, &color))
+                        PutPixel(ox + x, oy + y, color, LAYER_OBJ, forceAlphaBlend);
+                }
+            }
+        }
+    }
+}
+
+static void PutObjectSourcePixel(u32 layer, u32 x, u32 y, struct Rgb color, bool8 forceAlphaBlend)
+{
+    const u32 pixel = (layer * OBJECT_SOURCE_SIZE * OBJECT_SOURCE_SIZE + y * OBJECT_SOURCE_SIZE + x) * RGBA_CHANNELS;
+    u8 alpha = 255;
+
+    if (forceAlphaBlend)
+    {
+        u8 eva = REG_BLDALPHA & 0x1f;
+        if (eva > 16) eva = 16;
+        alpha = (eva * 255 + 8) / 16;
+    }
+    sObjectSourceRgba[pixel] = color.r;
+    sObjectSourceRgba[pixel + 1] = color.g;
+    sObjectSourceRgba[pixel + 2] = color.b;
+    sObjectSourceRgba[pixel + 3] = alpha;
+}
+
+static void RenderObjectSources(u16 dispcnt)
+{
+    const bool8 mapping1d = dispcnt & 0x40;
+    static const u8 sizes[3][4][2] = {
+        {{8, 8}, {16, 16}, {32, 32}, {64, 64}},
+        {{16, 8}, {32, 8}, {32, 16}, {64, 32}},
+        {{8, 16}, {8, 32}, {16, 32}, {32, 64}},
+    };
+    struct Rgb color;
+
+    sObjectSourceCount = 0;
+    if (!(dispcnt & DISPCNT_OBJ_ON))
+        return;
+    for (s32 i = OAM_ENTRY_COUNT - 1; i >= 0; i--)
+    {
+        const u32 base = OAM + i * 8;
+        const u16 a0 = ReadU16(base);
+        const u16 a1 = ReadU16(base + 2);
+        const u16 a2 = ReadU16(base + 4);
+        const u8 affineMode = (a0 >> 8) & 3;
+        const u8 objMode = (a0 >> 10) & 3;
+        const bool8 affine = affineMode & 1;
+        const u8 shape = (a0 >> 14) & 3;
+        const bool8 color256 = (a0 & 0x2000) != 0;
+        const u8 palette = (a2 >> 12) & 15;
+        const u16 tileBase = a2 & 0x3ff;
+        u32 layer;
+        s32 *descriptor;
+        u8 w;
+        u8 h;
+        u16 drawW;
+        u16 drawH;
+        s32 ox;
+        s32 oy;
+
+        if ((!affine && (a0 & 0x0200)) || shape == 3 || objMode == 2)
+            continue;
+        w = sizes[shape][(a1 >> 14) & 3][0];
+        h = sizes[shape][(a1 >> 14) & 3][1];
+        drawW = affine && affineMode == 3 ? w * 2 : w;
+        drawH = affine && affineMode == 3 ? h * 2 : h;
+        ox = OamScreenX(i, a1);
+        oy = OamScreenY(i, a0);
+
+        layer = sObjectSourceCount++;
+        for (u32 clearY = 0; clearY < h; clearY++)
+        {
+            const u32 row = (layer * OBJECT_SOURCE_SIZE * OBJECT_SOURCE_SIZE + clearY * OBJECT_SOURCE_SIZE) * RGBA_CHANNELS;
+            for (u32 clearX = 0; clearX < w * RGBA_CHANNELS; clearX++)
+                sObjectSourceRgba[row + clearX] = 0;
+        }
+        descriptor = &sObjectDescriptors[layer * OBJECT_DESCRIPTOR_WORDS];
+        descriptor[0] = i;
+        descriptor[1] = ox;
+        descriptor[2] = oy;
+        descriptor[3] = ox + (affine && affineMode == 3 ? w : w / 2);
+        descriptor[4] = oy + h + (affine && affineMode == 3 ? h / 2 : 0);
+        descriptor[5] = w;
+        descriptor[6] = h;
+        descriptor[7] = drawW;
+        descriptor[8] = drawH;
+        descriptor[9] = (a2 >> 10) & 3;
+        descriptor[10] = OamSpriteId(i);
+        descriptor[11] = affine ? 1 : 0;
+        descriptor[12] = 256;
+        descriptor[13] = 0;
+        descriptor[14] = 0;
+        descriptor[15] = 256;
+
+        if (affine)
+        {
+            const u8 matrix = (a1 >> 9) & 31;
+            const u32 matrixBase = OAM + matrix * 32;
+            descriptor[12] = Signed16(ReadU16(matrixBase + 6));
+            descriptor[13] = Signed16(ReadU16(matrixBase + 14));
+            descriptor[14] = Signed16(ReadU16(matrixBase + 22));
+            descriptor[15] = Signed16(ReadU16(matrixBase + 30));
+            for (u32 y = 0; y < h; y++)
+            {
+                for (u32 x = 0; x < w; x++)
+                {
+                    if (ObjPixel(tileBase, x, y, w, color256, palette, mapping1d, &color))
+                        PutObjectSourcePixel(layer, x, y, color, objMode == 1);
+                }
+            }
+        }
+        else
+        {
+            for (u32 y = 0; y < h; y++)
+            {
+                for (u32 x = 0; x < w; x++)
+                {
+                    const u8 px = a1 & 0x1000 ? w - 1 - x : x;
+                    const u8 py = a1 & 0x2000 ? h - 1 - y : y;
+                    if (ObjPixel(tileBase, px, py, w, color256, palette, mapping1d, &color))
+                        PutObjectSourcePixel(layer, x, y, color, objMode == 1);
+                }
+            }
+        }
+    }
+}
+
+static void RenderObjectPass(u16 dispcnt)
+{
+    ClearTransparent();
+    sRenderingObjectPass = TRUE;
+    for (s8 priority = 3; priority >= 0; priority--)
+        RenderSprites(dispcnt, priority);
+    sRenderingObjectPass = FALSE;
+    for (u32 i = 0; i < sizeof(sWasmObjectRgba); i++)
+        sWasmObjectRgba[i] = sWasmDisplayRgba[i];
+    for (u32 i = 0; i < sizeof(sWasmObjectIdData); i++)
+        sWasmObjectIdData[i] = sObjectIdData[i];
+}
+
+static void RenderTiled(u16 dispcnt, bool8 includeBg0, bool8 includeSprites)
+{
+    struct BgLayer layers[4];
+    const u8 count = BgLayersForMode(dispcnt, layers);
+
+    ClearScreen();
+    for (s8 priority = 3; priority >= 0; priority--)
+    {
+        for (u8 i = 0; i < count; i++)
+        {
+            const u8 bg = layers[i].bg;
+            if (!includeBg0 && bg == 0)
+                continue;
+            if ((ReadU16(REG_BASE + REG_OFFSET_BG0CNT + bg * 2) & 3) == priority)
+                RenderBgLayer(bg, layers[i].type);
+        }
+        if (includeSprites)
+            RenderSprites(dispcnt, priority);
+    }
+}
+
+void WasmRefreshHblankDmaGpuRegs(void)
+{
+    RefreshHblankDmaGpuRegs();
+}
+
+u32 WasmWindowMask(u32 x, u32 y)
+{
+    return WindowMask(x, y);
+}
+
+u32 WasmHblankDmaGpuRegActive(u32 offset)
+{
+    return offset < REG_OFFSET_DMA0 && sHblankDmaGpuRegs[offset >> 1].active;
+}
+
+
+static s32 FloorDiv16(s32 value)
+{
+    return value >= 0 ? value / 16 : -((-value + 15) / 16);
+}
+
+static bool8 MetatilePixel(u16 entry, u8 x, u8 y, struct Rgb *color)
+{
+    const u16 tile = entry & 0x3ff;
+    const u8 palette = (entry >> 12) & 15;
+    const u8 px = entry & 0x400 ? 7 - x : x;
+    const u8 py = entry & 0x800 ? 7 - y : y;
+    const u8 packed = *Ptr8(VRAM + tile * 32 + py * 4 + px / 2);
+    const u8 colorIndex = px & 1 ? packed >> 4 : packed & 15;
+
+    if (colorIndex == 0)
+        return FALSE;
+    *color = GbaColor(ReadU16(BG_PLTT + (palette * 16 + colorIndex) * 2));
+    return TRUE;
+}
+
+static struct Rgb DirectEffectColor(struct Rgb color, u8 layer, struct Rgb under, u8 underLayer,
+                                    bool8 effectsEnabled, u8 scanlineY)
+{
+    const u16 bldcnt = REG_BLDCNT;
+    const u8 effect = (bldcnt >> 6) & 3;
+
+    if (!effectsEnabled || !(bldcnt & layer))
+        return color;
+    if (effect == 1 && ((bldcnt >> 8) & underLayer))
+    {
+        const u16 alpha = REG_BLDALPHA;
+        const u8 eva = (alpha & 0x1f) > 16 ? 16 : alpha & 0x1f;
+        const u8 evb = ((alpha >> 8) & 0x1f) > 16 ? 16 : (alpha >> 8) & 0x1f;
+        color.r = ClampBlend(((u32)color.r * eva + (u32)under.r * evb) >> 4);
+        color.g = ClampBlend(((u32)color.g * eva + (u32)under.g * evb) >> 4);
+        color.b = ClampBlend(((u32)color.b * eva + (u32)under.b * evb) >> 4);
+    }
+    else if (effect == 2)
+    {
+        u8 evy = ScanlineGpuReg(REG_OFFSET_BLDY, scanlineY) & 0x1f;
+        if (evy > 16) evy = 16;
+        color.r += ((255 - color.r) * evy) >> 4;
+        color.g += ((255 - color.g) * evy) >> 4;
+        color.b += ((255 - color.b) * evy) >> 4;
+    }
+    else if (effect == 3)
+    {
+        u8 evy = ScanlineGpuReg(REG_OFFSET_BLDY, scanlineY) & 0x1f;
+        if (evy > 16) evy = 16;
+        color.r -= (color.r * evy) >> 4;
+        color.g -= (color.g * evy) >> 4;
+        color.b -= (color.b * evy) >> 4;
+    }
+    return color;
+}
+
+struct HdMapSample
+{
+    const struct MapLayout *layout;
+    u16 metatileId;
+    bool8 valid;
+};
+
+static struct HdMapSample sHdMapSamples[HD2D_SAMPLE_COLS * HD2D_SAMPLE_ROWS];
+static u16 sHdMapAttributes[HD2D_SAMPLE_COLS * HD2D_SAMPLE_ROWS];
+
+struct HdTilesetCache
+{
+    const struct Tileset *tileset;
+    u32 animationFrame;
+    u8 tiles[NUM_TILES_TOTAL * 32];
+    u16 palettes[16 * 16];
+    u16 displayPalettes[16 * 16];
+};
+
+static struct HdTilesetCache sHdTilesetCaches[16];
+static u8 sHdTilesetCacheNext;
+
+static const u8 *HdTilesetPixels(const struct Tileset *tileset)
+{
+    struct HdTilesetCache *cache = NULL;
+    const u32 frame = WasmTilesetAnimationFrame(tileset->isSecondary);
+    bool8 reset;
+
+    for (u32 i = 0; i < ARRAY_COUNT(sHdTilesetCaches); i++)
+    {
+        if (sHdTilesetCaches[i].tileset == tileset)
+        {
+            cache = &sHdTilesetCaches[i];
+            break;
+        }
+        if (cache == NULL && sHdTilesetCaches[i].tileset == NULL)
+            cache = &sHdTilesetCaches[i];
+    }
+    if (cache == NULL)
+        cache = &sHdTilesetCaches[sHdTilesetCacheNext++ % ARRAY_COUNT(sHdTilesetCaches)];
+    reset = cache->tileset != tileset
+         || (cache->animationFrame != 0xffffffff && cache->animationFrame > frame);
+    if (reset)
+    {
+        cache->tileset = tileset;
+        cache->animationFrame = 0xffffffff;
+        for (u32 palette = 0; palette < 16; palette++)
+        {
+            for (u32 color = 0; color < 16; color++)
+            {
+                const u32 index = palette * 16 + color;
+                cache->palettes[index] = tileset->palettes[palette][color];
+                cache->displayPalettes[index] = cache->palettes[index];
+            }
+        }
+        if (tileset->isCompressed)
+            LZ77UnCompWram(tileset->tiles, cache->tiles);
+        else
+        {
+            const u32 size = (tileset->isSecondary ? NUM_TILES_TOTAL - NUM_TILES_IN_PRIMARY
+                                                   : NUM_TILES_IN_PRIMARY) * 32;
+            const u8 *source = (const u8 *)tileset->tiles;
+            for (u32 i = 0; i < size; i++)
+                cache->tiles[i] = source[i];
+        }
+    }
+    if (cache->animationFrame != frame)
+    {
+        const u32 firstFrame = cache->animationFrame == 0xffffffff
+            ? (frame > 255 ? frame - 255 : 1)
+            : cache->animationFrame + 1;
+        // The engine increments each counter before invoking its callback, so
+        // the monotonic epoch identifies the last callback that ran. Replay
+        // the interval (cachedFrame, frame]. The inverted 1..0 interval still
+        // refreshes display palettes before the first callback.
+        WasmApplyTilesetAnimations(tileset, cache->tiles, cache->palettes,
+                                   cache->displayPalettes, firstFrame, frame);
+        cache->animationFrame = frame;
+    }
+    return cache->tiles;
+}
+
+static bool8 ResolveHdMapSample(s32 mapX, s32 mapY, struct HdMapSample *sample)
+{
+    const struct MapLayout *current = gMapHeader.mapLayout;
+    const s32 localX = mapX - MAP_OFFSET;
+    const s32 localY = mapY - MAP_OFFSET;
+
+    sample->layout = current;
+    sample->valid = FALSE;
+    if (localX >= 0 && localY >= 0 && localX < current->width && localY < current->height)
+    {
+        const u16 block = gBackupMapLayout.map[mapY * gBackupMapLayout.width + mapX];
+        sample->metatileId = block == MAPGRID_UNDEFINED ? MapGridGetMetatileIdAt(mapX, mapY) : UNPACK_METATILE(block);
+        sample->valid = TRUE;
+        return TRUE;
+    }
+    if (gMapHeader.connections != NULL)
+    {
+        for (s32 i = 0; i < gMapHeader.connections->count; i++)
+        {
+            const struct MapConnection *connection = &gMapHeader.connections->connections[i];
+            const struct MapHeader *header = GetMapHeaderFromConnection(connection);
+            const struct MapLayout *layout;
+            s32 x;
+            s32 y;
+
+            if (header == NULL || header->mapLayout == NULL)
+                continue;
+            layout = header->mapLayout;
+            switch (connection->direction)
+            {
+            case CONNECTION_NORTH:
+                x = localX - connection->offset;
+                y = layout->height + localY;
+                break;
+            case CONNECTION_SOUTH:
+                x = localX - connection->offset;
+                y = localY - current->height;
+                break;
+            case CONNECTION_WEST:
+                x = layout->width + localX;
+                y = localY - connection->offset;
+                break;
+            case CONNECTION_EAST:
+                x = localX - current->width;
+                y = localY - connection->offset;
+                break;
+            default:
+                continue;
+            }
+            if (x >= 0 && y >= 0 && x < layout->width && y < layout->height)
+            {
+                const u16 block = layout->map[y * layout->width + x];
+                sample->layout = layout;
+                sample->metatileId = UNPACK_METATILE(block);
+                sample->valid = TRUE;
+                return TRUE;
+            }
+        }
+    }
+    sample->metatileId = MapGridGetMetatileIdAt(mapX, mapY);
+    return FALSE;
+}
+
+
+static bool8 HdMetatilePixel(const struct MapLayout *layout, u16 metatileId, u8 half, u8 quadrant,
+                             u8 x, u8 y, struct Rgb *color)
+{
+    const struct Tileset *tileset;
+    const u16 *metatiles;
+    const u8 *tilePixels;
+    u16 localMetatile;
+    u16 entry;
+    u16 tile;
+    u8 palette;
+    u8 px;
+    u8 py;
+    u8 packed;
+    u8 colorIndex;
+    bool8 useVram;
+
+    if (metatileId >= NUM_METATILES_TOTAL)
+        metatileId = 0;
+    if (metatileId < NUM_METATILES_IN_PRIMARY)
+    {
+        tileset = layout->primaryTileset;
+        localMetatile = metatileId;
+        useVram = tileset == gMapHeader.mapLayout->primaryTileset;
+    }
+    else
+    {
+        tileset = layout->secondaryTileset;
+        localMetatile = metatileId - NUM_METATILES_IN_PRIMARY;
+        useVram = tileset == gMapHeader.mapLayout->secondaryTileset;
+    }
+    metatiles = tileset->metatiles + localMetatile * NUM_TILES_PER_METATILE;
+    entry = metatiles[half * 4 + quadrant];
+    if (useVram)
+        return MetatilePixel(entry, x, y, color);
+
+    tile = entry & 0x3ff;
+    if (tile < NUM_TILES_IN_PRIMARY)
+    {
+        tileset = layout->primaryTileset;
+    }
+    else
+    {
+        tileset = layout->secondaryTileset;
+        tile -= NUM_TILES_IN_PRIMARY;
+    }
+    tilePixels = HdTilesetPixels(tileset);
+    if (tilePixels == NULL)
+        return FALSE;
+    if ((!tileset->isSecondary && tile >= NUM_TILES_IN_PRIMARY)
+     || (tileset->isSecondary && tile >= NUM_TILES_TOTAL - NUM_TILES_IN_PRIMARY))
+        return FALSE;
+    palette = (entry >> 12) & 15;
+    px = entry & 0x400 ? 7 - x : x;
+    py = entry & 0x800 ? 7 - y : y;
+    packed = tilePixels[tile * 32 + py * 4 + px / 2];
+    colorIndex = px & 1 ? packed >> 4 : packed & 15;
+    if (colorIndex == 0)
+        return FALSE;
+    tileset = palette < NUM_PALS_IN_PRIMARY ? layout->primaryTileset : layout->secondaryTileset;
+    {
+        const struct Tileset *activeTileset = palette < NUM_PALS_IN_PRIMARY
+            ? gMapHeader.mapLayout->primaryTileset : gMapHeader.mapLayout->secondaryTileset;
+        if (tileset == activeTileset)
+            *color = GbaColor(ReadU16(BG_PLTT + (palette * 16 + colorIndex) * 2));
+        else
+        {
+            const u16 *paletteData = tileset->palettes[palette];
+            (void)HdTilesetPixels(tileset);
+            for (u32 i = 0; i < ARRAY_COUNT(sHdTilesetCaches); i++)
+            {
+                if (sHdTilesetCaches[i].tileset == tileset)
+                {
+                    paletteData = &sHdTilesetCaches[i].displayPalettes[palette * 16];
+                    break;
+                }
+            }
+            *color = GbaColor(paletteData[colorIndex]);
+        }
+    }
+    return TRUE;
+}
+
+static u16 HdMetatileAttributes(const struct MapLayout *layout, u16 metatileId)
+{
+    if (metatileId < NUM_METATILES_IN_PRIMARY)
+        return layout->primaryTileset->metatileAttributes[metatileId];
+    if (metatileId < NUM_METATILES_TOTAL)
+        return layout->secondaryTileset->metatileAttributes[metatileId - NUM_METATILES_IN_PRIMARY];
+    return 0;
+}
+
+static bool8 MapWorldPixel(s32 screenX, s32 screenY, s16 cameraOffsetX, s16 cameraOffsetY,
+                           const struct HdMapSample *sample, u16 attributes,
+                           struct Rgb *color, u8 *layer, s8 *height)
+{
+    const s32 viewX = screenX + cameraOffsetX;
+    const s32 viewY = screenY + cameraOffsetY;
+    const u8 localX = viewX - FloorDiv16(viewX) * 16;
+    const u8 localY = viewY - FloorDiv16(viewY) * 16;
+    const u8 quadrant = (localY / 8) * 2 + localX / 8;
+    const u8 pixelX = localX & 7;
+    const u8 pixelY = localY & 7;
+    u8 layerType;
+    u8 bottomLayer;
+    u8 topLayer;
+    struct Rgb bottomColor;
+    struct Rgb topColor;
+    bool8 bottomVisible;
+    bool8 topVisible;
+    u8 mask = WINDOW_ALL_LAYERS;
+
+    if (!sample->valid && (gMapHeader.mapType == MAP_TYPE_INDOOR
+                         || gMapHeader.mapType == MAP_TYPE_SECRET_BASE))
+    {
+        *color = (struct Rgb){0};
+        *layer = LAYER_BACKDROP;
+        *height = 0;
+        return FALSE;
+    }
+
+    layerType = UNPACK_LAYER_TYPE(attributes);
+    if (layerType == METATILE_LAYER_TYPE_SPLIT)
+    {
+        bottomLayer = LAYER_BG3;
+        topLayer = LAYER_BG1;
+    }
+    else if (layerType == METATILE_LAYER_TYPE_COVERED)
+    {
+        bottomLayer = LAYER_BG3;
+        topLayer = LAYER_BG2;
+    }
+    else
+    {
+        bottomLayer = LAYER_BG2;
+        topLayer = LAYER_BG1;
+    }
+
+    if (screenX >= 0 && screenX < DISPLAY_WIDTH && screenY >= 0 && screenY < DISPLAY_HEIGHT)
+        mask = WindowMask(screenX, screenY);
+    *color = GbaColor(ReadU16(BG_PLTT));
+    *layer = LAYER_BACKDROP;
+    bottomVisible = (mask & bottomLayer) && HdMetatilePixel(sample->layout, sample->metatileId, 0, quadrant, pixelX, pixelY, &bottomColor);
+    topVisible = (mask & topLayer) && HdMetatilePixel(sample->layout, sample->metatileId, 1, quadrant, pixelX, pixelY, &topColor);
+    if (bottomVisible)
+    {
+        *color = bottomColor;
+        *layer = bottomLayer;
+    }
+    if (topVisible)
+    {
+        const u8 scanlineY = screenY < 0 ? 0 : screenY >= DISPLAY_HEIGHT ? DISPLAY_HEIGHT - 1 : screenY;
+        *color = DirectEffectColor(topColor, topLayer, *color, *layer, mask & LAYER_BACKDROP, scanlineY);
+        *layer = topLayer;
+    }
+    else if (bottomVisible)
+    {
+        const u8 scanlineY = screenY < 0 ? 0 : screenY >= DISPLAY_HEIGHT ? DISPLAY_HEIGHT - 1 : screenY;
+        *color = DirectEffectColor(*color, *layer, GbaColor(ReadU16(BG_PLTT)), LAYER_BACKDROP,
+                                   mask & LAYER_BACKDROP, scanlineY);
+    }
+
+    // Collision, behavior, and elevation are gameplay masks rather than a
+    // visual height map. Treating them as geometry tears buildings and
+    // decorations apart and can sink actors into walkable mountain-top cells.
+    // Preserve authored pixel-art depth on one coherent perspective plane.
+    *height = 0;
+    return TRUE;
+}
+
+static void RenderHd2dWorld(u16 dispcnt)
+{
+    s16 cameraOffsetX;
+    s16 cameraOffsetY;
+
+    (void)dispcnt;
+    // Recover the full signed scripted pan from the same state used to place
+    // OAM. Unlike masking GetCameraOffsetWithPan to 0..15, this preserves the
+    // normal +32 vertical pan and larger camera shakes, keeping entity feet on
+    // their world tiles.
+    {
+        s16 gpuOffsetX;
+        s16 gpuOffsetY;
+        const s16 panX = (s16)(gTotalCameraPixelOffsetX - gSpriteCoordOffsetX);
+        const s16 panY = (s16)(gTotalCameraPixelOffsetY - gSpriteCoordOffsetY);
+
+        GetCameraOffsetWithPan(&gpuOffsetX, &gpuOffsetY);
+        cameraOffsetX = ((gpuOffsetX - panX - gFieldCamera.x) & 15) + gFieldCamera.x + panX;
+        cameraOffsetY = ((gpuOffsetY - panY - gFieldCamera.y) & 15) + gFieldCamera.y + panY;
+    }
+
+    // CameraMove advances the saved metatile position at the start of a
+    // 16-pixel step. Add the signed residual within that step so direct map
+    // sampling stays continuous instead of jumping one metatile twice.
+    if (gFieldCamera.x > 0) cameraOffsetX -= 16;
+    else if (gFieldCamera.x < 0) cameraOffsetX += 16;
+    if (gFieldCamera.y > 0) cameraOffsetY -= 16;
+    else if (gFieldCamera.y < 0) cameraOffsetY += 16;
+    // Anchor shader noise to map-space pixels rather than this frame's moving
+    // overscan atlas. The sum stays continuous through sub-tile camera motion.
+    sWasmWorldPixelOriginX = gSaveBlock1Ptr->pos.x * 16 - HD2D_WORLD_OFFSET_X + cameraOffsetX;
+    sWasmWorldPixelOriginY = gSaveBlock1Ptr->pos.y * 16 - HD2D_WORLD_OFFSET_Y + cameraOffsetY;
+    const s32 minMapX = gSaveBlock1Ptr->pos.x + FloorDiv16(-HD2D_WORLD_OFFSET_X + cameraOffsetX);
+    const s32 minMapY = gSaveBlock1Ptr->pos.y + FloorDiv16(-HD2D_WORLD_OFFSET_Y + cameraOffsetY);
+    const s32 maxMapX = gSaveBlock1Ptr->pos.x + FloorDiv16(HD2D_WORLD_WIDTH - HD2D_WORLD_OFFSET_X - 1 + cameraOffsetX);
+    const s32 maxMapY = gSaveBlock1Ptr->pos.y + FloorDiv16(HD2D_WORLD_HEIGHT - HD2D_WORLD_OFFSET_Y - 1 + cameraOffsetY);
+    const u32 sampleCols = maxMapX - minMapX + 1;
+    const u32 sampleRows = maxMapY - minMapY + 1;
+
+    for (u32 sampleY = 0; sampleY < sampleRows; sampleY++)
+    {
+        for (u32 sampleX = 0; sampleX < sampleCols; sampleX++)
+        {
+            const u32 index = sampleY * sampleCols + sampleX;
+            ResolveHdMapSample(minMapX + sampleX, minMapY + sampleY, &sHdMapSamples[index]);
+            sHdMapAttributes[index] = HdMetatileAttributes(sHdMapSamples[index].layout,
+                                                           sHdMapSamples[index].metatileId);
+        }
+    }
+    for (u32 y = 0; y < HD2D_WORLD_HEIGHT; y++)
+    {
+        for (u32 x = 0; x < HD2D_WORLD_WIDTH; x++)
+        {
+            const s32 screenX = (s32)x - HD2D_WORLD_OFFSET_X;
+            const s32 screenY = (s32)y - HD2D_WORLD_OFFSET_Y;
+            const u32 pixel = y * HD2D_WORLD_WIDTH + x;
+            const u32 p = pixel * RGBA_CHANNELS;
+            struct Rgb color;
+            u8 layer;
+            s8 height;
+
+            const s32 mapX = gSaveBlock1Ptr->pos.x + FloorDiv16(screenX + cameraOffsetX);
+            const s32 mapY = gSaveBlock1Ptr->pos.y + FloorDiv16(screenY + cameraOffsetY);
+            const u32 sampleIndex = (mapY - minMapY) * sampleCols + mapX - minMapX;
+            const bool8 mapVisible = MapWorldPixel(screenX, screenY, cameraOffsetX, cameraOffsetY,
+                                                   &sHdMapSamples[sampleIndex], sHdMapAttributes[sampleIndex],
+                                                   &color, &layer, &height);
+            sWasmWorldRgba[p] = color.r;
+            sWasmWorldRgba[p + 1] = color.g;
+            sWasmWorldRgba[p + 2] = color.b;
+            sWasmWorldRgba[p + 3] = mapVisible ? 255 : 0;
+            sWasmWorldLayerData[pixel] = layer;
+            if (layer == LAYER_BG1)
+                sWasmBgPriorityData[pixel] = ReadU16(REG_BASE + REG_OFFSET_BG1CNT) & 3;
+            else if (layer == LAYER_BG2)
+                sWasmBgPriorityData[pixel] = ReadU16(REG_BASE + REG_OFFSET_BG2CNT) & 3;
+            else if (layer == LAYER_BG3)
+                sWasmBgPriorityData[pixel] = ReadU16(REG_BASE + REG_OFFSET_BG3CNT) & 3;
+            else
+                sWasmBgPriorityData[pixel] = 4;
+            sWasmWorldHeightData[pixel] = height;
+        }
+    }
+}
+
+static void CopyCanonicalWorld(void)
+{
+    for (u32 y = 0; y < DISPLAY_HEIGHT; y++)
+    {
+        for (u32 x = 0; x < DISPLAY_WIDTH; x++)
+        {
+            const u32 source = y * DISPLAY_WIDTH + x;
+            const u32 target = (y + HD2D_WORLD_OFFSET_Y) * HD2D_WORLD_WIDTH + x + HD2D_WORLD_OFFSET_X;
+            const u32 sourceRgba = source * RGBA_CHANNELS;
+            const u32 targetRgba = target * RGBA_CHANNELS;
+
+            // Do not turn the native border filler outside indoor layouts
+            // into projected terrain when replacing the canonical viewport.
+            if (sWasmWorldRgba[targetRgba + 3] == 0)
+                continue;
+            sWasmWorldRgba[targetRgba] = sWasmDisplayRgba[sourceRgba];
+            sWasmWorldRgba[targetRgba + 1] = sWasmDisplayRgba[sourceRgba + 1];
+            sWasmWorldRgba[targetRgba + 2] = sWasmDisplayRgba[sourceRgba + 2];
+            sWasmWorldRgba[targetRgba + 3] = sWasmDisplayRgba[sourceRgba + 3];
+            sWasmWorldLayerData[target] = sLayerData[source] & (LAYER_BG1 | LAYER_BG2 | LAYER_BG3 | LAYER_BACKDROP);
+            if (!(WindowMask(x, y) & LAYER_OBJ))
+                sWasmBgPriorityData[target] = 0xff;
+            else if (sLayerData[source] == LAYER_BG1)
+                sWasmBgPriorityData[target] = ReadU16(REG_BASE + REG_OFFSET_BG1CNT) & 3;
+            else if (sLayerData[source] == LAYER_BG2)
+                sWasmBgPriorityData[target] = ReadU16(REG_BASE + REG_OFFSET_BG2CNT) & 3;
+            else if (sLayerData[source] == LAYER_BG3)
+                sWasmBgPriorityData[target] = ReadU16(REG_BASE + REG_OFFSET_BG3CNT) & 3;
+            else
+                sWasmBgPriorityData[target] = 4;
+        }
+    }
+}
+
+void WasmRenderFrame(void)
+{
+    const u16 dispcnt = REG_DISPCNT;
+    const u8 mode = dispcnt & 7;
+
+    WasmRefreshHblankDmaGpuRegs();
+    if (mode == 3)
+        RenderBitmapMode3();
+    else if (mode == 4)
+        RenderBitmapMode4(dispcnt);
+    else
+        RenderTiled(dispcnt, TRUE, TRUE);
+
+    if (mode == 3 || mode == 4)
+        RenderSprites(dispcnt, -1);
+}
+
+void WasmRenderHd2dFrame(void)
+{
+    const u16 dispcnt = REG_DISPCNT;
+    const u8 mode = dispcnt & 7;
+
+    if (mode > 2)
+    {
+        WasmRenderFrame();
+        return;
+    }
+
+    WasmRefreshHblankDmaGpuRegs();
+    RenderHd2dWorld(dispcnt);
+    // Keep the canonical viewport sourced from the live BG tilemaps so doors,
+    // tile overrides, animations, windows, and scanline effects remain exact.
+    RenderTiled(dispcnt, FALSE, FALSE);
+    CopyCanonicalWorld();
+    RenderObjectSources(dispcnt);
+    RenderObjectPass(dispcnt);
+    RenderTiled(dispcnt, TRUE, TRUE);
+}
+
+u32 WasmDisplaySceneKind(void)
+{
+    const u8 mode = REG_DISPCNT & 7;
+
+    if (mode != 0)
+        return 0;
+    // Basic-overworld callbacks are used by field transitions whose
+    // screen-space effects cannot be projected faithfully.
+    if (gMain.callback2 != CB2_Overworld)
+        return 0;
+    if (gMapHeader.mapType == MAP_TYPE_NONE)
+        return 0;
+    RefreshHblankDmaGpuRegs();
+    for (u32 offset = 0; offset < REG_OFFSET_DMA0; offset += 2)
+    {
+        if (sHblankDmaGpuRegs[offset >> 1].active)
+            return 0;
+    }
+    // Hardware effects selecting OBJ as target 1 are not baked into the
+    // independent raw billboard sources. Keep alpha, brighten, and darken
+    // frames exact rather than presenting entities with the wrong treatment.
+    if (((REG_BLDCNT >> 6) & 3) != 0 && (REG_BLDCNT & LAYER_OBJ))
+        return 0;
+    for (u32 i = 0; i < OAM_ENTRY_COUNT; i++)
+    {
+        const u16 attr0 = ReadU16(OAM + i * 8);
+        if (((attr0 >> 10) & 3) == 1)
+            return 0;
+    }
+    return 1;
+}
+
+u8 *WasmWorldBuffer(void)
+{
+    return sWasmWorldRgba;
+}
+
+void WasmSetHd2dEnabled(u32 enabled)
+{
+    sWasmHd2dEnabled = enabled != 0;
+}
+
+u32 WasmHd2dEnabled(void)
+{
+    return sWasmHd2dEnabled;
+}
+
+u32 WasmWorldBufferSize(void)
+{
+    return sizeof(sWasmWorldRgba);
+}
+
+u32 WasmWorldWidth(void)
+{
+    return HD2D_WORLD_WIDTH;
+}
+
+u32 WasmWorldHeight(void)
+{
+    return HD2D_WORLD_HEIGHT;
+}
+
+u32 WasmWorldGridOffsetX(void)
+{
+    return (HD2D_WORLD_OFFSET_X - (REG_BG1HOFS & (HD2D_TILE_WIDTH - 1))) & (HD2D_TILE_WIDTH - 1);
+}
+
+u32 WasmWorldGridOffsetY(void)
+{
+    return (HD2D_WORLD_OFFSET_Y - (REG_BG1VOFS & (HD2D_TILE_WIDTH - 1))) & (HD2D_TILE_WIDTH - 1);
+}
+
+s32 WasmWorldPixelOriginX(void)
+{
+    return sWasmWorldPixelOriginX;
+}
+
+s32 WasmWorldPixelOriginY(void)
+{
+    return sWasmWorldPixelOriginY;
+}
+
+u8 *WasmWorldLayerBuffer(void)
+{
+    return sWasmWorldLayerData;
+}
+
+u32 WasmWorldLayerBufferSize(void)
+{
+    return sizeof(sWasmWorldLayerData);
+}
+
+s8 *WasmWorldHeightBuffer(void)
+{
+    return sWasmWorldHeightData;
+}
+
+u32 WasmWorldHeightBufferSize(void)
+{
+    return sizeof(sWasmWorldHeightData);
+}
+
+u8 *WasmDisplayLayerBuffer(void)
+{
+    return sLayerData;
+}
+
+u32 WasmDisplayLayerBufferSize(void)
+{
+    return sizeof(sLayerData);
+}
+
+u8 *WasmDisplayObjectIdBuffer(void)
+{
+    return sWasmObjectIdData;
+}
+
+u32 WasmDisplayObjectIdBufferSize(void)
+{
+    return sizeof(sWasmObjectIdData);
+}
+
+u8 *WasmDisplayBgPriorityBuffer(void)
+{
+    return sWasmBgPriorityData;
+}
+
+u32 WasmDisplayBgPriorityBufferSize(void)
+{
+    return sizeof(sWasmBgPriorityData);
+}
+
+u8 *WasmDisplayObjectSourceBuffer(void)
+{
+    return sObjectSourceRgba;
+}
+
+u32 WasmDisplayObjectSourceBufferSize(void)
+{
+    return sizeof(sObjectSourceRgba);
+}
+
+s32 *WasmDisplayObjectDescriptorBuffer(void)
+{
+    return sObjectDescriptors;
+}
+
+u32 WasmDisplayObjectDescriptorBufferSize(void)
+{
+    return sizeof(sObjectDescriptors);
+}
+
+u32 WasmDisplayObjectSourceCount(void)
+{
+    return sObjectSourceCount;
+}
+
+u8 *WasmDisplayObjectBuffer(void)
+{
+    return sWasmObjectRgba;
+}
+
+u32 WasmDisplayObjectBufferSize(void)
+{
+    return sizeof(sWasmObjectRgba);
+}
+
+s16 *WasmDisplayObjectAnchors(void)
+{
+    return sObjectAnchors;
+}
+
+u32 WasmDisplayObjectAnchorsSize(void)
+{
+    return sizeof(sObjectAnchors);
+}
+
+u8 *WasmDisplayObjectPriorities(void)
+{
+    return sObjectPriorities;
+}
+
+u32 WasmDisplayObjectPrioritiesSize(void)
+{
+    return sizeof(sObjectPriorities);
+}
+
+u8 *WasmDisplayBuffer(void)
+{
+    return sWasmDisplayRgba;
+}
+
+u32 WasmDisplayBufferSize(void)
+{
+    return sizeof(sWasmDisplayRgba);
+}
+
+#endif // WASM
