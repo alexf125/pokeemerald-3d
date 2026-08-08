@@ -39,6 +39,9 @@ SHAPE_HEIGHTS = {
     "cliff": 8,
     "object": 3,
 }
+# Optional extension points for map-specific experimentation. They can be
+# populated by importing this module and mutating the dictionaries before
+# calling generate_voxel_model().
 AUTHORED_POSITION_SHAPES: dict[tuple[str, int, int], "ShapeRecord"] = {}
 AUTHORED_FLAT_SHAPES: dict[str, "ShapeRecord"] = {}
 
@@ -350,7 +353,8 @@ def resolve_shapes(
         elif material_name == "structure" or cell.layer_type != 0 or cell.collision:
             shapes[position] = ShapeRecord("wall", SHAPE_HEIGHTS["wall"], "flat", True)
         else:
-            shapes[position] = ShapeRecord(material_name, 0, "flat", True)
+            shape_class = "ground" if material_name in ("ground", "grass", "tall_grass", "sand", "ice") else material_name
+            shapes[position] = ShapeRecord(shape_class, 0, "flat", True)
     return shapes
 
 
@@ -492,19 +496,21 @@ def build_building_voxels(
     elevation_scale: int,
 ) -> list[Voxel]:
     voxels: list[Voxel] = []
+    occupied_positions: set[tuple[int, int, int]] = set()
     base_height = resolved_elevation * elevation_scale
     target_layers = max(SHAPE_HEIGHTS["wall"], min(SHAPE_HEIGHTS["roof"], len(profile.bands) + 1))
+    source_bands = profile.bands if profile.bands and profile.bands[0] == cell else (cell, *profile.bands)
     world_start = profile.span[0] * SUBVOXEL_SCALE
     world_end = (profile.span[1] + 1) * SUBVOXEL_SCALE - 1
     world_center = (world_start + world_end) / 2
 
     for block_index in range(SUBVOXEL_SCALE * SUBVOXEL_SCALE):
-        if all(band.block_coverage[block_index] == 0 for band in profile.bands):
+        if all(band.block_coverage[block_index] == 0 for band in source_bands):
             continue
         world_x = cell.x * SUBVOXEL_SCALE + (block_index % SUBVOXEL_SCALE)
         world_y = cell.y * SUBVOXEL_SCALE + (block_index // SUBVOXEL_SCALE)
         for layer_index in range(target_layers):
-            source = profile.bands[min(layer_index, len(profile.bands) - 1)]
+            source = source_bands[min(layer_index, len(source_bands) - 1)]
             if source.block_coverage[block_index] == 0:
                 continue
             z = base_height + layer_index
@@ -513,8 +519,14 @@ def build_building_voxels(
                 span_radius = max(1.0, (world_end - world_start) / 2)
                 distance = abs(world_x - world_center)
                 if distance < span_radius * 0.6:
-                    voxels.append(Voxel(world_x, world_y, z + 1, color, spec.name))
-            voxels.append(Voxel(world_x, world_y, z, color, spec.name))
+                    position = (world_x, world_y, z + 1)
+                    if position not in occupied_positions:
+                        voxels.append(Voxel(world_x, world_y, z + 1, color, spec.name))
+                        occupied_positions.add(position)
+            position = (world_x, world_y, z)
+            if position not in occupied_positions:
+                voxels.append(Voxel(world_x, world_y, z, color, spec.name))
+                occupied_positions.add(position)
     return voxels
 
 
@@ -583,9 +595,11 @@ def ramp_block_heights(
 
 
 def inclusive_height_range(top_height: int) -> range:
-    bottom = min(0, top_height)
-    top = max(0, top_height)
-    return range(bottom, top + 1)
+    if top_height < 0:
+        # Water and other recessed surfaces intentionally sit one layer below
+        # the local baseline; the final z_shift normalizes any negative output.
+        return range(top_height, top_height + 1)
+    return range(0, top_height + 1)
 
 
 def is_walkable_cell(cell: ParsedCell, material_name: str) -> bool:
@@ -647,9 +661,9 @@ def detect_front_span(
     materials_by_cell: dict[tuple[int, int], str],
     cells_by_pos: dict[tuple[int, int], ParsedCell],
 ) -> tuple[int, int]:
-    horizontal = direction[0] == 0
-    start = end = anchor.x if horizontal else anchor.y
-    step_axis = ((-1, 0), (1, 0)) if horizontal else ((0, -1), (0, 1))
+    depth_along_y = direction[0] == 0
+    start = end = anchor.x if depth_along_y else anchor.y
+    step_axis = ((-1, 0), (1, 0)) if depth_along_y else ((0, -1), (0, 1))
     for dx, dy in step_axis:
         x = anchor.x
         y = anchor.y
@@ -662,7 +676,7 @@ def detect_front_span(
             material_name = materials_by_cell[(candidate.x, candidate.y)]
             if not is_front_face_candidate(candidate, direction, material_name, materials_by_cell, cells_by_pos):
                 break
-            axis_value = x if horizontal else y
+            axis_value = x if depth_along_y else y
             if dx < 0 or dy < 0:
                 start = axis_value
             else:
@@ -694,7 +708,7 @@ def measure_building_bands(
 ) -> list[ParsedCell]:
     bands: list[ParsedCell] = []
     last_signature: tuple[int, ...] | None = None
-    repeated_rows = 0
+    repeated_bands = 0
     for depth in range(MAX_BUILDING_BANDS):
         candidate = cells_by_pos.get(
             (front_cell.x + direction[0] * depth, front_cell.y + direction[1] * depth)
@@ -706,11 +720,13 @@ def measure_building_bands(
             break
         signature = tuple(color_signature(color) for color in candidate.block_colors)
         if signature == last_signature:
-            repeated_rows += 1
-            if repeated_rows >= 2:
+            repeated_bands += 1
+            # Stop before a third identical band so repeated forest/cliff rows do
+            # not keep extruding upward as a single monolith.
+            if repeated_bands >= 2:
                 break
         else:
-            repeated_rows = 0
+            repeated_bands = 0
         last_signature = signature
         bands.append(candidate)
         if sum(candidate.row_coverage) <= 8:

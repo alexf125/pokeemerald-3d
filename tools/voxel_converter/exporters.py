@@ -332,14 +332,15 @@ def ambient_occlusion(
         direction = -1 if corner[axis] == 0 else 1
         offset = [0, 0, 0]
         offset[axis] = direction
-        side_offsets.append(tuple(offset))
+        side_offsets.append((offset[0], offset[1], offset[2]))
     side_a = has_neighbor(occupancy, voxel, side_offsets[0])
     side_b = has_neighbor(occupancy, voxel, side_offsets[1])
-    diagonal = has_neighbor(
-        occupancy,
-        voxel,
-        tuple(side_offsets[0][axis] + side_offsets[1][axis] for axis in range(3)),
+    diagonal_offset = (
+        side_offsets[0][0] + side_offsets[1][0],
+        side_offsets[0][1] + side_offsets[1][1],
+        side_offsets[0][2] + side_offsets[1][2],
     )
+    diagonal = has_neighbor(occupancy, voxel, diagonal_offset)
     if side_a and side_b:
         return 0.72
     blocked = int(side_a) + int(side_b) + int(diagonal)
