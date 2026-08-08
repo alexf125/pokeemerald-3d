@@ -16,20 +16,30 @@ layout data into simple voxel geometry for inspection and browser preview.
 ## Repo-specific notes
 
 The current repo stores metatiles as **8 tile entries per metatile**: 4 bottom
-layer tiles plus 4 top layer tiles. The converter composites the visible top
-pixels from those two layers and emits **4×4 voxel columns per metatile** so
-each exported tile keeps sub-voxel color detail.
+layer tiles plus 4 top layer tiles. The converter samples the tileset atlas
+directly, tracks per-block opacity/row coverage, and emits **4×4 voxel columns
+per metatile** so each exported tile keeps sub-voxel color detail while still
+fitting MagicaVoxel-sized exports.
 
-Voxel height combines map block elevation, metatile behavior, and local tile
-context:
+Voxel shape resolution combines map block elevation, metatile behavior, and
+local tile context in priority order:
 
-- regular elevation levels are scaled as `voxel_height = elevation * 2`
-- `ELEVATION_MULTI_LEVEL` tiles inherit nearby walkable heights instead of
-  becoming giant spikes
-- building/door/covered tiles inherit nearby raised ground so structures render
-  above the terrain rather than as depressions
-- stair/ladder/escalator behaviors can emit a per-block height ramp across the
-  tile
+- authored overrides (if any are configured in the generator)
+- detected building facades anchored from door/front tiles
+- sparse per-block object silhouettes based on drawn opacity
+- tile-level fallbacks for water, rock/cliff, structure, and walkable ground
+
+That allows the generator to:
+
+- keep regular elevation levels at `voxel_height = elevation * 2`
+- collapse multi-row building art into raised front facades instead of leaving
+  the roof rows behind as flat depressions
+- preserve `ELEVATION_MULTI_LEVEL` tiles by inheriting nearby walkable heights
+- emit stair/ladder/escalator ramps as local per-block gradients
+- treat sparse props as measured-height voxel objects instead of solid slabs
+
+glTF / GLB exports also apply directional face shading and simple ambient
+occlusion so the raised geometry reads more clearly in viewers.
 
 The generator still keeps one visible surface voxel even at ground level so
 flat terrain remains visible in exported models.

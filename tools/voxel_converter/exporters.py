@@ -8,6 +8,15 @@ from pathlib import Path
 
 from .generator import MATERIAL_SPECS, MaterialSpec, Voxel, VoxelModel
 
+FACE_SHADE = {
+    (0, 0, 1): 1.00,
+    (0, 1, 0): 0.90,
+    (1, 0, 0): 0.84,
+    (-1, 0, 0): 0.72,
+    (0, -1, 0): 0.68,
+    (0, 0, -1): 0.55,
+}
+
 
 def export_json(model: VoxelModel, output_path: Path) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -218,12 +227,12 @@ def build_mesh_by_material(
             if neighbor in occupancy:
                 continue
             base_index = len(mesh["positions"]) // 3
-            color = [channel / 255 for channel in voxel.color]
             for corner in corners:
+                shaded_color = shaded_vertex_color(occupancy, voxel, normal, corner)
                 position = (voxel.x + corner[0], voxel.z + corner[2], voxel.y + corner[1])
                 mesh["positions"].extend(position)
                 mesh["normals"].extend((normal[0], normal[2], normal[1]))
-                mesh["colors"].extend(color)
+                mesh["colors"].extend(shaded_color)
                 for axis in range(3):
                     mesh["position_min"][axis] = min(mesh["position_min"][axis], position[axis])
                     mesh["position_max"][axis] = max(mesh["position_max"][axis], position[axis])
@@ -289,3 +298,58 @@ def _vox_chunk(tag: str, content: bytes, children: bytes = b"") -> bytes:
 def quantize_vox_color(color: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
     quantized = tuple(min(255, round(channel / 51) * 51) for channel in color[:3])
     return (quantized[0], quantized[1], quantized[2], 255)
+
+
+def shaded_vertex_color(
+    occupancy: dict[tuple[int, int, int], Voxel],
+    voxel: Voxel,
+    normal: tuple[int, int, int],
+    corner: tuple[int, int, int],
+) -> list[float]:
+    face_shade = FACE_SHADE.get(normal, 1.0)
+    occlusion = ambient_occlusion(occupancy, voxel, normal, corner)
+    crease = 0.92 if normal[2] == 0 and voxel.z <= 1 else 1.0
+    shade = max(0.0, min(1.0, face_shade * occlusion * crease))
+    return [
+        min(1.0, (voxel.color[0] / 255) * shade),
+        min(1.0, (voxel.color[1] / 255) * shade),
+        min(1.0, (voxel.color[2] / 255) * shade),
+        voxel.color[3] / 255,
+    ]
+
+
+def ambient_occlusion(
+    occupancy: dict[tuple[int, int, int], Voxel],
+    voxel: Voxel,
+    normal: tuple[int, int, int],
+    corner: tuple[int, int, int],
+) -> float:
+    tangent_axes = [axis for axis, delta in enumerate(normal) if delta == 0]
+    if len(tangent_axes) != 2:
+        return 1.0
+    side_offsets: list[tuple[int, int, int]] = []
+    for axis in tangent_axes:
+        direction = -1 if corner[axis] == 0 else 1
+        offset = [0, 0, 0]
+        offset[axis] = direction
+        side_offsets.append((offset[0], offset[1], offset[2]))
+    side_a = has_neighbor(occupancy, voxel, side_offsets[0])
+    side_b = has_neighbor(occupancy, voxel, side_offsets[1])
+    diagonal_offset = (
+        side_offsets[0][0] + side_offsets[1][0],
+        side_offsets[0][1] + side_offsets[1][1],
+        side_offsets[0][2] + side_offsets[1][2],
+    )
+    diagonal = has_neighbor(occupancy, voxel, diagonal_offset)
+    if side_a and side_b:
+        return 0.72
+    blocked = int(side_a) + int(side_b) + int(diagonal)
+    return 1.0 - blocked * 0.1
+
+
+def has_neighbor(
+    occupancy: dict[tuple[int, int, int], Voxel],
+    voxel: Voxel,
+    offset: tuple[int, int, int],
+) -> bool:
+    return (voxel.x + offset[0], voxel.y + offset[1], voxel.z + offset[2]) in occupancy
